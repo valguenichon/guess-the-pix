@@ -53,6 +53,12 @@ class Database:
                     master_id INTEGER NOT NULL,
                     solution TEXT NOT NULL,
                     image_url TEXT,
+                    hint_1 TEXT,
+                    hint_2 TEXT,
+                    hint_3 TEXT,
+                    hint_1_revealed_at TEXT,
+                    hint_2_revealed_at TEXT,
+                    hint_3_revealed_at TEXT,
                     started_at TEXT NOT NULL,
                     ends_at TEXT NOT NULL,
                     closed_at TEXT,
@@ -97,6 +103,18 @@ class Database:
                 await db.execute("ALTER TABLE guild_state ADD COLUMN scoreboard_channel_id INTEGER")
             if "scoreboard_message_id" not in columns:
                 await db.execute("ALTER TABLE guild_state ADD COLUMN scoreboard_message_id INTEGER")
+
+            round_columns = {row["name"] for row in await (await db.execute("PRAGMA table_info(rounds)")).fetchall()}
+            for column, definition in (
+                ("hint_1", "TEXT"),
+                ("hint_2", "TEXT"),
+                ("hint_3", "TEXT"),
+                ("hint_1_revealed_at", "TEXT"),
+                ("hint_2_revealed_at", "TEXT"),
+                ("hint_3_revealed_at", "TEXT"),
+            ):
+                if column not in round_columns:
+                    await db.execute(f"ALTER TABLE rounds ADD COLUMN {column} {definition}")
 
             await db.commit()
 
@@ -264,6 +282,9 @@ class Database:
         master_id: int,
         solution: str,
         image_url: str | None,
+        hint_1: str,
+        hint_2: str,
+        hint_3: str,
         started_at: str,
         ends_at: str,
     ) -> int:
@@ -272,13 +293,46 @@ class Database:
                 """
                 INSERT INTO rounds(
                     guild_id, channel_id, master_id, solution, image_url,
-                    started_at, ends_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+                    hint_1, hint_2, hint_3, started_at, ends_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
                 """,
-                (guild_id, channel_id, master_id, solution, image_url, started_at, ends_at),
+                (
+                    guild_id, channel_id, master_id, solution, image_url,
+                    hint_1, hint_2, hint_3, started_at, ends_at,
+                ),
             )
             await db.commit()
             return int(cursor.lastrowid)
+
+    async def update_round_image_url(self, round_id: int, image_url: str | None) -> None:
+        async with self.connection() as db:
+            await db.execute(
+                "UPDATE rounds SET image_url = ? WHERE id = ?",
+                (image_url, round_id),
+            )
+            await db.commit()
+
+    async def open_rounds(self):
+        async with self.connection() as db:
+            return await (await db.execute(
+                """
+                SELECT * FROM rounds
+                WHERE status = 'open'
+                ORDER BY started_at ASC
+                """
+            )).fetchall()
+
+    async def mark_hint_revealed(self, round_id: int, hint_number: int, revealed_at: str) -> bool:
+        if hint_number not in {1, 2, 3}:
+            raise ValueError("Numéro d’indice invalide")
+        column = f"hint_{hint_number}_revealed_at"
+        async with self.connection() as db:
+            cursor = await db.execute(
+                f"UPDATE rounds SET {column} = ? WHERE id = ? AND {column} IS NULL",
+                (revealed_at, round_id),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
 
     async def create_attempt(self, guild_id: int, round_id: int, user_id: int, answer: str) -> int:
         async with self.connection() as db:

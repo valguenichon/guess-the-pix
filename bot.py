@@ -16,7 +16,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.8.0-url-image"
+BOT_VERSION = "0.9.0-hints"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -49,6 +49,35 @@ def format_elapsed(start_iso: str, end_iso: str) -> str:
     if not parts or (not days and not hours and minutes < 5):
         parts.append(f"{seconds} s")
     return " ".join(parts[:3])
+
+
+def round_has_hints(round_row) -> bool:
+    return all(bool(round_row[f"hint_{index}"]) for index in (1, 2, 3))
+
+
+def hint_stage_for_submission(round_row, submitted_at: str) -> int:
+    """Nombre d’indices déjà réellement publiés au moment de la réponse."""
+    submitted = datetime.fromisoformat(submitted_at)
+    stage = 0
+    for index in (1, 2, 3):
+        revealed_at = round_row[f"hint_{index}_revealed_at"]
+        if revealed_at and datetime.fromisoformat(revealed_at) <= submitted:
+            stage += 1
+    return stage
+
+
+def podium_points(rank: int, hint_stage: int) -> int:
+    """Barème : 6/5/4, 5/4/3, 4/3/2, puis 3/2/1."""
+    base = (3, 2, 1)[rank]
+    return base + max(0, 3 - hint_stage)
+
+
+def hint_stage_label(stage: int) -> str:
+    if stage == 0:
+        return "avant tout indice"
+    if stage == 1:
+        return "après 1 indice"
+    return f"après {stage} indices"
 
 
 def is_admin(interaction: discord.Interaction) -> bool:
@@ -167,6 +196,21 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
         placeholder="Nom exact du jeu",
         max_length=200,
     )
+    hint_1 = discord.ui.TextInput(
+        label="Indice 1 — publié après 2 jours",
+        placeholder="Premier indice",
+        max_length=300,
+    )
+    hint_2 = discord.ui.TextInput(
+        label="Indice 2 — publié après 4 jours",
+        placeholder="Deuxième indice",
+        max_length=300,
+    )
+    hint_3 = discord.ui.TextInput(
+        label="Indice 3 — publié après 6 jours",
+        placeholder="Troisième indice",
+        max_length=300,
+    )
 
     def __init__(
         self,
@@ -211,6 +255,9 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             master_id=interaction.user.id,
             solution=str(self.solution).strip(),
             image_url=None,
+            hint_1=str(self.hint_1).strip(),
+            hint_2=str(self.hint_2).strip(),
+            hint_3=str(self.hint_3).strip(),
             started_at=now.isoformat(),
             ends_at=ends.isoformat(),
         )
@@ -219,7 +266,8 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             title=f"🎮 Manche #{round_id}",
             description=(
                 f"Proposée par {interaction.user.mention}\n"
-                f"**Pour participer :** utilisez **`/reponse`** puis saisissez le nom du jeu.\n\n"
+                f"**Pour participer :** utilisez **`/reponse`** puis saisissez le nom du jeu.\n"
+                f"💡 Trois indices seront publiés après **2, 4 et 6 jours**.\n\n"
                 f"Fin : <t:{int(ends.timestamp())}:F> — <t:{int(ends.timestamp())}:R>"
             ),
         )
@@ -356,10 +404,22 @@ class ScoreBot(commands.Bot):
         if active_round:
             if active_round["status"] == "open":
                 participant_count = await db.round_participant_count(active_round["id"])
+                hint_status_text = ""
+                if round_has_hints(active_round):
+                    revealed_count = sum(
+                        1 for index in (1, 2, 3) if active_round[f"hint_{index}_revealed_at"]
+                    )
+                    next_hint_text = ""
+                    if revealed_count < 3:
+                        next_hint_number = revealed_count + 1
+                        next_hint_at = datetime.fromisoformat(active_round["started_at"]) + timedelta(days=next_hint_number * 2)
+                        next_hint_text = f" — prochain <t:{int(next_hint_at.timestamp())}:R>"
+                    hint_status_text = f"\nIndices révélés : **{revealed_count}/3**{next_hint_text}"
                 round_text = (
                     f"**Manche #{active_round['id']} en cours**\n"
                     f"Meneur : <@{active_round['master_id']}>\n"
-                    f"Fin : {discord_ts(active_round['ends_at'], 'F')} ({discord_ts(active_round['ends_at'], 'R')})\n"
+                    f"Fin : {discord_ts(active_round['ends_at'], 'F')} ({discord_ts(active_round['ends_at'], 'R')})"
+                    f"{hint_status_text}\n"
                     f"Participants ayant répondu : **{participant_count}**"
                 )
             else:
@@ -516,8 +576,47 @@ class ScoreBot(commands.Bot):
             if not remaining:
                 await self.finish_round(refreshed["round_id"])
 
+    async def publish_due_hints(self) -> None:
+        now = datetime.now(timezone.utc)
+        for round_row in await db.open_rounds():
+            if not round_has_hints(round_row):
+                continue
+            started = datetime.fromisoformat(round_row["started_at"])
+            for hint_number, day_offset in ((1, 2), (2, 4), (3, 6)):
+                if round_row[f"hint_{hint_number}_revealed_at"]:
+                    continue
+                if now < started + timedelta(days=day_offset):
+                    continue
+
+                channel = self.get_channel(round_row["channel_id"])
+                if channel is None:
+                    try:
+                        channel = await self.fetch_channel(round_row["channel_id"])
+                    except discord.HTTPException:
+                        channel = None
+                if not isinstance(channel, discord.abc.Messageable):
+                    continue
+
+                remaining_points = {1: "5 / 4 / 3", 2: "4 / 3 / 2", 3: "3 / 2 / 1"}[hint_number]
+                embed = discord.Embed(
+                    title=f"💡 Indice {hint_number}/3 — Manche #{round_row['id']}",
+                    description=round_row[f"hint_{hint_number}"],
+                    timestamp=now,
+                )
+                embed.set_footer(text=f"Barème du podium à partir de maintenant : {remaining_points} points")
+                try:
+                    hint_message = await channel.send(embed=embed)
+                except discord.HTTPException:
+                    continue
+
+                revealed_at = hint_message.created_at.isoformat()
+                if await db.mark_hint_revealed(round_row["id"], hint_number, revealed_at):
+                    round_row = await db.get_round(round_row["id"])
+                    await self.update_scoreboard(round_row["guild_id"])
+
     @tasks.loop(seconds=60)
     async def close_due_rounds(self) -> None:
+        await self.publish_due_hints()
         due = await db.due_rounds(datetime.now(timezone.utc).isoformat())
         for row in due:
             await self.lock_round_and_maybe_finish(row["id"])
@@ -577,12 +676,18 @@ class ScoreBot(commands.Bot):
 
         winners = list(await db.first_correct_by_user(round_id))
         podium = winners[:3]
-        points = [3, 2, 1]
+        awarded_points: list[int] = []
+        podium_stages: list[int] = []
+        hints_enabled = round_has_hints(round_row)
         for rank, row in enumerate(podium):
+            stage = hint_stage_for_submission(round_row, row["submitted_at"]) if hints_enabled else 3
+            points = podium_points(rank, stage)
+            awarded_points.append(points)
+            podium_stages.append(stage)
             await db.add_score(
                 round_row["guild_id"],
                 row["user_id"],
-                points[rank],
+                points,
                 f"podium_{rank + 1}",
                 round_id,
             )
@@ -599,7 +704,7 @@ class ScoreBot(commands.Bot):
             await db.add_score(
                 round_row["guild_id"],
                 round_row["master_id"],
-                2,
+                4,
                 "unfound_master_bonus",
                 round_id,
             )
@@ -647,15 +752,18 @@ class ScoreBot(commands.Bot):
             podium_lines = []
             for i, row in enumerate(podium):
                 elapsed = format_elapsed(round_row["started_at"], row["submitted_at"])
+                points = awarded_points[i]
+                stage = podium_stages[i]
+                timing_label = hint_stage_label(stage) if hints_enabled else "sans système d’indices"
                 podium_lines.append(
-                    f"{medals[i]} <@{row['user_id']}> — **+{points[i]} pt{'s' if points[i] > 1 else ''}** "
-                    f"— trouvé en **{elapsed}**"
+                    f"{medals[i]} <@{row['user_id']}> — **+{points} pt{'s' if points > 1 else ''}** "
+                    f"— trouvé en **{elapsed}**, {timing_label}"
                 )
             embed.add_field(name="Podium", value="\n".join(podium_lines), inline=False)
         else:
             embed.add_field(
                 name="Introuvable",
-                value=f"Personne n’a trouvé : <@{round_row['master_id']}> gagne **+2 points**.",
+                value=f"Personne n’a trouvé : <@{round_row['master_id']}> gagne **+4 points**.",
                 inline=False,
             )
 
@@ -676,7 +784,7 @@ class ScoreBot(commands.Bot):
 
         if round_row["image_url"]:
             embed.set_image(url=round_row["image_url"])
-        embed.set_footer(text="Les temps sont calculés depuis le lancement de la manche.")
+        embed.set_footer(text="Les points dépendent du rang et du nombre d’indices déjà révélés au moment de la bonne réponse.")
 
         channel = self.get_channel(round_row["channel_id"])
         if channel is None:
@@ -701,10 +809,10 @@ def game_channel_ok(interaction: discord.Interaction) -> bool:
 async def help_command(interaction: discord.Interaction):
     text = [
         "**Règles en bref**",
-        "• Une manche dure **7 jours** : le meneur publie une capture.",
+        "• Une manche dure **7 jours** ; 3 indices sont publiés à **J+2, J+4 et J+6**.",
         "• Les réponses restent privées et sont validées par le meneur.",
-        "• 🥇 **3 pts** · 🥈 **2 pts** · 🥉 **1 pt**, selon l’ordre des bonnes réponses.",
-        "• Si personne ne trouve : **+2 pts au meneur**.",
+        "• Podium : **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2**, et **3/2/1** après le 3e.",
+        "• Si personne ne trouve : **+4 pts au meneur**.",
         "• Le 1er devient meneur suivant ; s’il passe, tirage hors gagnant et meneur sortant. Sans gagnant, tirage hors meneur sortant.",
         "",
         "**Commandes joueurs**",
@@ -715,7 +823,7 @@ async def help_command(interaction: discord.Interaction):
         "Les tirages utilisent automatiquement les deux rôles participants configurés.",
         "",
         "**Commandes du meneur**",
-        "`/lancer image:...` ou `/lancer url:...` — lancer une manche de 7 jours",
+        "`/lancer image:...` ou `/lancer url:...` — lancer une manche et saisir ses 3 indices",
         "`/passe` — passer la main avant de lancer la manche",
     ]
     if is_admin(interaction):
