@@ -1,0 +1,12 @@
+services:
+  discord-scoreboard:
+    build: .
+    container_name: discord-scoreboard
+    restart: unless-stopped
+    env_file:
+      - /volume1/docker/discord-scoreboard/.env
+    volumes:
+      - /volume1/docker/discord-scoreboard/data:/app/data
+      - /volume1/docker/discord-scoreboard/bot.py:/app/bot.py:ro
+      - /volume1/docker/discord-scoreboard/config.py:/app/config.py:ro
+      - /volume1/docker/discord-scoreboard/database.py:/app/database.py:ro
