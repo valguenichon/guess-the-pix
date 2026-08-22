@@ -253,6 +253,30 @@ class Database:
         choices = [row["user_id"] for row in rows if row["user_id"] not in excluded]
         return random.choice(choices) if choices else None
 
+    async def is_participant_active(self, guild_id: int, user_id: int) -> bool:
+        async with self.connection() as db:
+            row = await (await db.execute(
+                "SELECT active FROM participants WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )).fetchone()
+        return bool(row and row["active"])
+
+    async def active_participant_ids(self, guild_id: int) -> list[int]:
+        async with self.connection() as db:
+            rows = await (await db.execute(
+                "SELECT user_id FROM participants WHERE guild_id = ? AND active = 1 ORDER BY joined_at ASC",
+                (guild_id,),
+            )).fetchall()
+        return [int(row["user_id"]) for row in rows]
+
+    async def active_participant_count(self, guild_id: int) -> int:
+        async with self.connection() as db:
+            row = await (await db.execute(
+                "SELECT COUNT(*) AS n FROM participants WHERE guild_id = ? AND active = 1",
+                (guild_id,),
+            )).fetchone()
+        return int(row["n"])
+
     async def get_open_round(self, guild_id: int):
         async with self.connection() as db:
             return await (await db.execute(

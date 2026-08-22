@@ -4,7 +4,6 @@ import asyncio
 import io
 import logging
 import mimetypes
-import random
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlparse
 
@@ -16,7 +15,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.9.0-hints"
+BOT_VERSION = "0.10.0-participation"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -98,27 +97,27 @@ def is_admin(interaction: discord.Interaction) -> bool:
     )
 
 
-def is_participant(member: discord.Member) -> bool:
-    if not config.participant_role_ids:
-        return True
-    role_ids = {role.id for role in member.roles}
-    return any(role_id in role_ids for role_id in config.participant_role_ids)
+async def random_registered_participant(guild: discord.Guild, excluded: set[int]) -> int | None:
+    """Tire au sort uniquement parmi les utilisateurs inscrits avec /participer."""
+    participant_ids = await db.active_participant_ids(guild.id)
+    eligible: list[int] = []
+    for user_id in participant_ids:
+        if user_id in excluded:
+            continue
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+        if not member.bot:
+            eligible.append(user_id)
 
+    if not eligible:
+        return None
 
-async def random_role_participant(guild: discord.Guild, excluded: set[int]) -> int | None:
-    members = list(guild.members)
-    if guild.member_count and len(members) < guild.member_count:
-        try:
-            members = [member async for member in guild.fetch_members(limit=None)]
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-    eligible = [
-        member.id
-        for member in members
-        if not member.bot and member.id not in excluded and is_participant(member)
-    ]
-    return random.choice(eligible) if eligible else None
+    import random
+    return random.choice(eligible)
 
 
 class ValidationView(discord.ui.View):
@@ -266,7 +265,7 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             title=f"🎮 Manche #{round_id}",
             description=(
                 f"Proposée par {interaction.user.mention}\n"
-                f"**Pour participer :** utilisez **`/reponse`** puis saisissez le nom du jeu.\n"
+                f"**Pour participer :** inscrivez-vous avec **`/participer`**, puis utilisez **`/reponse`**.\n"
                 f"💡 Trois indices seront publiés après **2, 4 et 6 jours**.\n\n"
                 f"Fin : <t:{int(ends.timestamp())}:F> — <t:{int(ends.timestamp())}:R>"
             ),
@@ -287,7 +286,6 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
 class ScoreBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.members = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self) -> None:
@@ -433,7 +431,9 @@ class ScoreBot(commands.Bot):
         else:
             round_text = "Aucune manche en cours et aucun meneur désigné."
 
+        registered_count = await db.active_participant_count(guild_id)
         embed.add_field(name="État du jeu", value=round_text, inline=False)
+        embed.add_field(name="Participants inscrits", value=f"**{registered_count}**", inline=True)
         embed.set_footer(text=f"Mise à jour automatique • bot {BOT_VERSION}")
         return embed
 
@@ -695,11 +695,37 @@ class ScoreBot(commands.Bot):
         next_master: int | None = None
         next_master_reason: str
         if podium:
-            next_master = podium[0]["user_id"]
-            await db.set_master(
-                round_row["guild_id"], next_master, previous_master_id=round_row["master_id"]
-            )
-            next_master_reason = f"🎮 <@{next_master}> devient le **prochain meneur**."
+            # Le premier joueur encore inscrit devient meneur. Un joueur ayant quitté
+            # le jeu conserve ses points, mais n’est plus désignable comme meneur.
+            for winner in winners:
+                if await db.is_participant_active(round_row["guild_id"], winner["user_id"]):
+                    next_master = winner["user_id"]
+                    break
+
+            if next_master is None:
+                guild = self.get_guild(round_row["guild_id"])
+                next_master = (
+                    await random_registered_participant(guild, excluded={round_row["master_id"]})
+                    if guild is not None
+                    else None
+                )
+
+            if next_master:
+                await db.set_master(
+                    round_row["guild_id"], next_master, previous_master_id=round_row["master_id"]
+                )
+                if next_master == podium[0]["user_id"]:
+                    next_master_reason = f"🎮 <@{next_master}> devient le **prochain meneur**."
+                else:
+                    next_master_reason = f"🎮 <@{next_master}> devient le **prochain meneur** parmi les participants encore inscrits."
+            else:
+                await db.clear_master(
+                    round_row["guild_id"], previous_master_id=round_row["master_id"]
+                )
+                next_master_reason = (
+                    "⚠️ Aucun participant inscrit n’est disponible pour devenir meneur. "
+                    "Un Admin du jeu doit utiliser `/designer`."
+                )
         else:
             await db.add_score(
                 round_row["guild_id"],
@@ -710,7 +736,7 @@ class ScoreBot(commands.Bot):
             )
             guild = self.get_guild(round_row["guild_id"])
             next_master = (
-                await random_role_participant(guild, excluded={round_row["master_id"]})
+                await random_registered_participant(guild, excluded={round_row["master_id"]})
                 if guild is not None
                 else None
             )
@@ -728,7 +754,7 @@ class ScoreBot(commands.Bot):
                     round_row["guild_id"], previous_master_id=round_row["master_id"]
                 )
                 next_master_reason = (
-                    "⚠️ Aucun autre membre ayant un rôle participant n’est éligible au tirage. "
+                    "⚠️ Aucun autre participant inscrit n’est éligible au tirage. "
                     "Un Admin du jeu doit utiliser `/designer`."
                 )
 
@@ -809,18 +835,20 @@ def game_channel_ok(interaction: discord.Interaction) -> bool:
 async def help_command(interaction: discord.Interaction):
     text = [
         "**Règles en bref**",
+        "• Utilisez **`/participer`** pour vous inscrire au jeu ; seuls les inscrits peuvent répondre et être tirés au sort.",
         "• Une manche dure **7 jours** ; 3 indices sont publiés à **J+2, J+4 et J+6**.",
         "• Les réponses restent privées et sont validées par le meneur.",
         "• Podium : **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2**, et **3/2/1** après le 3e.",
         "• Si personne ne trouve : **+4 pts au meneur**.",
-        "• Le 1er devient meneur suivant ; s’il passe, tirage hors gagnant et meneur sortant. Sans gagnant, tirage hors meneur sortant.",
+        "• Le 1er devient meneur suivant ; s’il passe, tirage hors gagnant et meneur sortant. Sans gagnant, tirage parmi les inscrits hors meneur sortant.",
         "",
         "**Commandes joueurs**",
-        "`/reponse` — proposer une réponse secrète",
+        "`/participer` — s’inscrire au jeu",
+        "`/quitter` — se désinscrire du jeu",
+        "`/reponse` — proposer une réponse secrète (participants inscrits uniquement)",
         "`/score` — afficher le classement ; avec un joueur, afficher ses statistiques",
         "`/meneur` — afficher le meneur actuel",
         "`/historique` — afficher les dernières manches",
-        "Les tirages utilisent automatiquement les deux rôles participants configurés.",
         "",
         "**Commandes du meneur**",
         "`/lancer image:...` ou `/lancer url:...` — lancer une manche et saisir ses 3 indices",
@@ -848,8 +876,8 @@ async def designate(interaction: discord.Interaction, joueur: discord.Member):
     if await db.get_active_round(interaction.guild_id):
         await interaction.response.send_message("Impossible de changer de meneur tant que la manche n’est pas totalement clôturée.", ephemeral=True)
         return
-    if not is_participant(joueur):
-        await interaction.response.send_message("Ce membre ne possède aucun des rôles participants configurés.", ephemeral=True)
+    if not await db.is_participant_active(interaction.guild_id, joueur.id):
+        await interaction.response.send_message("Ce membre n’est pas inscrit au jeu. Il doit d’abord utiliser `/participer`.", ephemeral=True)
         return
     state = await db.get_state(interaction.guild_id)
     await db.set_master(interaction.guild_id, joueur.id, previous_master_id=state["current_master_id"])
@@ -904,6 +932,61 @@ async def start(
     await interaction.response.send_modal(StartRoundModal(bot, capture=capture, image_url=(url or "").strip() or None))
 
 
+@bot.tree.command(name="participer", description="S’inscrire au jeu")
+async def join_game(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Commande disponible uniquement sur le serveur.", ephemeral=True)
+        return
+    if not game_channel_ok(interaction):
+        await interaction.response.send_message("Cette commande doit être utilisée dans le canal du jeu.", ephemeral=True)
+        return
+    if await db.is_participant_active(interaction.guild_id, interaction.user.id):
+        await interaction.response.send_message("✅ Tu participes déjà au jeu.", ephemeral=True)
+        return
+
+    await db.set_participant(interaction.guild_id, interaction.user.id, True)
+    await interaction.response.send_message(
+        "✅ Tu participes maintenant au jeu. Tu peux utiliser `/reponse` pendant les manches et tu es éligible aux tirages au sort.",
+        ephemeral=True,
+    )
+    await bot.update_scoreboard(interaction.guild_id)
+
+
+@bot.tree.command(name="quitter", description="Se désinscrire du jeu")
+async def leave_game(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Commande disponible uniquement sur le serveur.", ephemeral=True)
+        return
+    if not game_channel_ok(interaction):
+        await interaction.response.send_message("Cette commande doit être utilisée dans le canal du jeu.", ephemeral=True)
+        return
+    if not await db.is_participant_active(interaction.guild_id, interaction.user.id):
+        await interaction.response.send_message("Tu n’es pas actuellement inscrit au jeu.", ephemeral=True)
+        return
+
+    state = await db.get_state(interaction.guild_id)
+    if state["current_master_id"] == interaction.user.id:
+        active_round = await db.get_active_round(interaction.guild_id)
+        if active_round:
+            await interaction.response.send_message(
+                "Le meneur d’une manche en cours ne peut pas quitter le jeu avant sa clôture.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "Tu es le prochain meneur. Utilise d’abord `/passe` avant de quitter le jeu.",
+                ephemeral=True,
+            )
+        return
+
+    await db.set_participant(interaction.guild_id, interaction.user.id, False)
+    await interaction.response.send_message(
+        "Tu ne participes plus au jeu. Tes scores et ton historique sont conservés, mais tu ne peux plus répondre ni être tiré au sort.",
+        ephemeral=True,
+    )
+    await bot.update_scoreboard(interaction.guild_id)
+
+
 @bot.tree.command(name="reponse", description="Envoyer une réponse secrète au meneur")
 @app_commands.describe(reponse="Nom du jeu proposé")
 async def answer(interaction: discord.Interaction, reponse: str):
@@ -913,8 +996,8 @@ async def answer(interaction: discord.Interaction, reponse: str):
     if not game_channel_ok(interaction):
         await interaction.response.send_message("Cette commande doit être utilisée dans le canal du jeu.", ephemeral=True)
         return
-    if not isinstance(interaction.user, discord.Member) or not is_participant(interaction.user):
-        await interaction.response.send_message("Cette commande est réservée aux membres ayant un rôle participant.", ephemeral=True)
+    if not await db.is_participant_active(interaction.guild_id, interaction.user.id):
+        await interaction.response.send_message("Vous devez d’abord vous inscrire avec `/participer` pour pouvoir répondre.", ephemeral=True)
         return
     round_row = await db.get_open_round(interaction.guild_id)
     if not round_row:
@@ -964,10 +1047,10 @@ async def pass_turn(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Serveur Discord introuvable.", ephemeral=True)
         return
-    new_master = await random_role_participant(interaction.guild, excluded)
+    new_master = await random_registered_participant(interaction.guild, excluded)
     if not new_master:
         await interaction.response.send_message(
-            "Aucun autre membre ayant un rôle participant n’est éligible au tirage.",
+            "Aucun autre participant inscrit n’est éligible au tirage.",
             ephemeral=True,
         )
         return
