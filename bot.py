@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import mimetypes
 import random
 from datetime import datetime, timedelta, timezone
+from urllib.parse import unquote, urlparse
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -12,7 +16,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.7.3-reset"
+BOT_VERSION = "0.8.0-url-image"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -164,10 +168,16 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
         max_length=200,
     )
 
-    def __init__(self, bot: "ScoreBot", capture: discord.Attachment):
+    def __init__(
+        self,
+        bot: "ScoreBot",
+        capture: discord.Attachment | None = None,
+        image_url: str | None = None,
+    ):
         super().__init__()
         self.bot = bot
         self.capture = capture
+        self.image_url = image_url
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.guild_id is None or interaction.channel_id is None:
@@ -187,6 +197,12 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             await interaction.response.send_message("Seul le meneur désigné peut lancer la manche.", ephemeral=True)
             return
 
+        try:
+            upload_file = await self.bot.prepare_round_image(self.capture, self.image_url)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
         now = datetime.now(timezone.utc)
         ends = now + timedelta(days=config.round_duration_days)
         round_id = await db.create_round(
@@ -194,7 +210,7 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             channel_id=interaction.channel_id,
             master_id=interaction.user.id,
             solution=str(self.solution).strip(),
-            image_url=self.capture.url,
+            image_url=None,
             started_at=now.isoformat(),
             ends_at=ends.isoformat(),
         )
@@ -203,12 +219,20 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             title=f"🎮 Manche #{round_id}",
             description=(
                 f"Proposée par {interaction.user.mention}\n"
-                f"Répondez anonymement avec **`/reponse réponse:`**.\n\n"
+                f"**Pour participer :** utilisez **`/reponse`** puis saisissez le nom du jeu.\n\n"
                 f"Fin : <t:{int(ends.timestamp())}:F> — <t:{int(ends.timestamp())}:R>"
             ),
         )
-        embed.set_image(url=self.capture.url)
-        await interaction.response.send_message(embed=embed)
+        embed.set_image(url=f"attachment://{upload_file.filename}")
+        await interaction.response.send_message(embed=embed, file=upload_file)
+
+        try:
+            message = await interaction.original_response()
+        except discord.HTTPException:
+            message = None
+        if message and message.attachments:
+            await db.update_round_image_url(round_id, message.attachments[0].url)
+
         await self.bot.update_scoreboard(interaction.guild_id)
 
 
@@ -250,6 +274,63 @@ class ScoreBot(commands.Bot):
             )
 
         self.close_due_rounds.start()
+
+    async def prepare_round_image(
+        self,
+        capture: discord.Attachment | None,
+        image_url: str | None,
+    ) -> discord.File:
+        if capture is None and not image_url:
+            raise ValueError("Vous devez fournir soit une image, soit une URL d’image.")
+        if capture is not None and image_url:
+            raise ValueError("Choisissez soit une image, soit une URL d’image, pas les deux.")
+
+        data: bytes
+        filename: str
+        content_type: str | None = None
+
+        if capture is not None:
+            content_type = capture.content_type
+            if content_type and not content_type.startswith("image/"):
+                raise ValueError("La capture doit être une image.")
+            try:
+                data = await capture.read()
+            except discord.HTTPException as exc:
+                raise ValueError("Impossible de lire l’image envoyée.") from exc
+            filename = capture.filename or "capture"
+        else:
+            raw_url = (image_url or "").strip()
+            parsed = urlparse(raw_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("L’URL doit être une adresse http(s) publique pointant vers une image.")
+            timeout = aiohttp.ClientTimeout(total=20)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(raw_url, allow_redirects=True) as response:
+                        if response.status != 200:
+                            raise ValueError(f"Impossible de récupérer l’image (HTTP {response.status}).")
+                        content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+                        if not content_type.startswith("image/"):
+                            raise ValueError("L’URL fournie ne pointe pas vers une image exploitable.")
+                        data = await response.read()
+            except asyncio.TimeoutError as exc:
+                raise ValueError("Le téléchargement de l’image a expiré.") from exc
+            except aiohttp.ClientError as exc:
+                raise ValueError("Impossible de télécharger l’image depuis cette URL.") from exc
+
+            filename = unquote(parsed.path.rsplit("/", 1)[-1]) or "capture"
+
+        if not data:
+            raise ValueError("L’image fournie est vide.")
+        if len(data) > 8 * 1024 * 1024:
+            raise ValueError("L’image dépasse 8 Mo, ce qui est trop lourd pour cette commande.")
+
+        filename = filename.strip().replace(chr(92), "_").replace("/", "_") or "capture"
+        if "." not in filename:
+            ext = mimetypes.guess_extension(content_type or "") or ".png"
+            filename = f"{filename}{ext}"
+
+        return discord.File(io.BytesIO(data), filename=filename)
 
     async def build_scoreboard_embed(self, guild_id: int) -> discord.Embed:
         state = await db.get_state(guild_id)
@@ -627,14 +708,14 @@ async def help_command(interaction: discord.Interaction):
         "• Le 1er devient meneur suivant ; s’il passe, tirage hors gagnant et meneur sortant. Sans gagnant, tirage hors meneur sortant.",
         "",
         "**Commandes joueurs**",
-        "`/reponse réponse:` — proposer une réponse secrète",
+        "`/reponse` — proposer une réponse secrète",
         "`/score` — afficher le classement ; avec un joueur, afficher ses statistiques",
         "`/meneur` — afficher le meneur actuel",
         "`/historique` — afficher les dernières manches",
         "Les tirages utilisent automatiquement les deux rôles participants configurés.",
         "",
         "**Commandes du meneur**",
-        "`/lancer capture:` — lancer une manche de 7 jours avec une capture",
+        "`/lancer image:...` ou `/lancer url:...` — lancer une manche de 7 jours",
         "`/passe` — passer la main avant de lancer la manche",
     ]
     if is_admin(interaction):
@@ -681,15 +762,28 @@ async def leader(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="lancer", description="Lancer la manche hebdomadaire")
-@app_commands.describe(capture="Capture d’écran du jeu à deviner")
-async def start(interaction: discord.Interaction, capture: discord.Attachment):
+@app_commands.describe(
+    capture="Capture d’écran du jeu à deviner",
+    url="URL publique d’une image à utiliser comme capture",
+)
+async def start(
+    interaction: discord.Interaction,
+    capture: discord.Attachment | None = None,
+    url: str | None = None,
+):
     if interaction.guild_id is None:
         await interaction.response.send_message("Commande disponible uniquement sur le serveur.", ephemeral=True)
         return
     if not game_channel_ok(interaction):
         await interaction.response.send_message("Cette commande doit être utilisée dans le canal du jeu.", ephemeral=True)
         return
-    if capture.content_type and not capture.content_type.startswith("image/"):
+    if capture is None and not (url and url.strip()):
+        await interaction.response.send_message("Vous devez fournir soit une image, soit une URL d’image.", ephemeral=True)
+        return
+    if capture is not None and url and url.strip():
+        await interaction.response.send_message("Choisissez soit une image, soit une URL d’image, pas les deux.", ephemeral=True)
+        return
+    if capture is not None and capture.content_type and not capture.content_type.startswith("image/"):
         await interaction.response.send_message("La capture doit être une image.", ephemeral=True)
         return
     state = await db.get_state(interaction.guild_id)
@@ -699,7 +793,7 @@ async def start(interaction: discord.Interaction, capture: discord.Attachment):
     if await db.get_active_round(interaction.guild_id):
         await interaction.response.send_message("Une manche est déjà en cours ou en attente de validation finale.", ephemeral=True)
         return
-    await interaction.response.send_modal(StartRoundModal(bot, capture))
+    await interaction.response.send_modal(StartRoundModal(bot, capture=capture, image_url=(url or "").strip() or None))
 
 
 @bot.tree.command(name="reponse", description="Envoyer une réponse secrète au meneur")
