@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.10.0-participation"
+BOT_VERSION = "0.11.0-accelerated"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -77,6 +77,45 @@ def hint_stage_label(stage: int) -> str:
     if stage == 1:
         return "après 1 indice"
     return f"après {stage} indices"
+
+
+def compute_accelerated_timing(round_row, accelerated_at: datetime) -> tuple[datetime, dict[int, datetime]]:
+    """Calcule la nouvelle fin et les horaires des indices encore cachés.
+
+    La manche ne dépasse jamais sa limite initiale. Les indices restants sont
+    répartis uniformément dans le temps restant, sans jamais repousser leur
+    horaire normal.
+    """
+    original_end = datetime.fromisoformat(round_row["original_ends_at"] or round_row["ends_at"])
+    effective_end = min(original_end, accelerated_at + timedelta(hours=24))
+
+    hidden = [
+        number for number in (1, 2, 3)
+        if not round_row[f"hint_{number}_revealed_at"]
+    ]
+    schedules: dict[int, datetime] = {}
+    remaining_seconds = max(0.0, (effective_end - accelerated_at).total_seconds())
+    slot_seconds = remaining_seconds / (len(hidden) + 1) if hidden else 0.0
+
+    started = datetime.fromisoformat(round_row["started_at"])
+    hidden_position = {number: index for index, number in enumerate(hidden, start=1)}
+    for number in (1, 2, 3):
+        raw_original = round_row[f"hint_{number}_scheduled_at"]
+        normal_due = (
+            datetime.fromisoformat(raw_original)
+            if raw_original
+            else started + timedelta(days=number * 2)
+        )
+        if number not in hidden_position:
+            schedules[number] = normal_due
+            continue
+
+        accelerated_due = accelerated_at + timedelta(
+            seconds=slot_seconds * hidden_position[number]
+        )
+        schedules[number] = min(normal_due, accelerated_due)
+
+    return effective_end, schedules
 
 
 def is_admin(interaction: discord.Interaction) -> bool:
@@ -196,17 +235,17 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
         max_length=200,
     )
     hint_1 = discord.ui.TextInput(
-        label="Indice 1 — publié après 2 jours",
+        label="Indice 1 — prévu à J+2",
         placeholder="Premier indice",
         max_length=300,
     )
     hint_2 = discord.ui.TextInput(
-        label="Indice 2 — publié après 4 jours",
+        label="Indice 2 — prévu à J+4",
         placeholder="Deuxième indice",
         max_length=300,
     )
     hint_3 = discord.ui.TextInput(
-        label="Indice 3 — publié après 6 jours",
+        label="Indice 3 — prévu à J+6",
         placeholder="Troisième indice",
         max_length=300,
     )
@@ -248,6 +287,9 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
 
         now = datetime.now(timezone.utc)
         ends = now + timedelta(days=config.round_duration_days)
+        hint_1_at = now + timedelta(days=2)
+        hint_2_at = now + timedelta(days=4)
+        hint_3_at = now + timedelta(days=6)
         round_id = await db.create_round(
             guild_id=interaction.guild_id,
             channel_id=interaction.channel_id,
@@ -259,6 +301,9 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             hint_3=str(self.hint_3).strip(),
             started_at=now.isoformat(),
             ends_at=ends.isoformat(),
+            hint_1_scheduled_at=hint_1_at.isoformat(),
+            hint_2_scheduled_at=hint_2_at.isoformat(),
+            hint_3_scheduled_at=hint_3_at.isoformat(),
         )
 
         embed = discord.Embed(
@@ -266,8 +311,9 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             description=(
                 f"Proposée par {interaction.user.mention}\n"
                 f"**Pour participer :** inscrivez-vous avec **`/participer`**, puis utilisez **`/reponse`**.\n"
-                f"💡 Trois indices seront publiés après **2, 4 et 6 jours**.\n\n"
-                f"Fin : <t:{int(ends.timestamp())}:F> — <t:{int(ends.timestamp())}:R>"
+                f"💡 Trois indices sont prévus à **J+2, J+4 et J+6**.\n"
+                f"⚡ Dès la première bonne réponse validée, il restera **24 h maximum** et les indices encore cachés seront rapprochés.\n\n"
+                f"Fin maximale : <t:{int(ends.timestamp())}:F> — <t:{int(ends.timestamp())}:R>"
             ),
         )
         embed.set_image(url=f"attachment://{upload_file.filename}")
@@ -408,15 +454,26 @@ class ScoreBot(commands.Bot):
                         1 for index in (1, 2, 3) if active_round[f"hint_{index}_revealed_at"]
                     )
                     next_hint_text = ""
-                    if revealed_count < 3:
-                        next_hint_number = revealed_count + 1
-                        next_hint_at = datetime.fromisoformat(active_round["started_at"]) + timedelta(days=next_hint_number * 2)
-                        next_hint_text = f" — prochain <t:{int(next_hint_at.timestamp())}:R>"
+                    unrevealed = [
+                        index for index in (1, 2, 3)
+                        if not active_round[f"hint_{index}_revealed_at"]
+                    ]
+                    if unrevealed:
+                        next_hint_number = unrevealed[0]
+                        raw_next_hint_at = active_round[f"hint_{next_hint_number}_scheduled_at"]
+                        if raw_next_hint_at:
+                            next_hint_at = datetime.fromisoformat(raw_next_hint_at)
+                            next_hint_text = f" — prochain <t:{int(next_hint_at.timestamp())}:R>"
                     hint_status_text = f"\nIndices révélés : **{revealed_count}/3**{next_hint_text}"
+                accelerated_text = (
+                    f"\n⚡ Mode accéléré actif depuis {discord_ts(active_round['accelerated_at'], 'R')}"
+                    if active_round["accelerated_at"] else ""
+                )
                 round_text = (
                     f"**Manche #{active_round['id']} en cours**\n"
                     f"Meneur : <@{active_round['master_id']}>\n"
                     f"Fin : {discord_ts(active_round['ends_at'], 'F')} ({discord_ts(active_round['ends_at'], 'R')})"
+                    f"{accelerated_text}"
                     f"{hint_status_text}\n"
                     f"Participants ayant répondu : **{participant_count}**"
                 )
@@ -561,6 +618,14 @@ class ScoreBot(commands.Bot):
             except discord.HTTPException:
                 pass
 
+        if status == "correct":
+            reviewed_attempt = await db.get_attempt(int(raw_attempt_id))
+            if reviewed_attempt and reviewed_attempt["reviewed_at"]:
+                await self.trigger_acceleration(
+                    reviewed_attempt["round_id"],
+                    datetime.fromisoformat(reviewed_attempt["reviewed_at"]),
+                )
+
         try:
             player = await self.fetch_user(attempt["user_id"])
             await player.send(
@@ -576,16 +641,70 @@ class ScoreBot(commands.Bot):
             if not remaining:
                 await self.finish_round(refreshed["round_id"])
 
+    async def trigger_acceleration(self, round_id: int, accelerated_at: datetime) -> bool:
+        round_row = await db.get_round(round_id)
+        if not round_row or round_row["status"] != "open" or round_row["accelerated_at"]:
+            return False
+
+        effective_end, schedules = compute_accelerated_timing(round_row, accelerated_at)
+        if effective_end <= accelerated_at:
+            return False
+
+        changed = await db.accelerate_round(
+            round_id=round_id,
+            accelerated_at=accelerated_at.isoformat(),
+            ends_at=effective_end.isoformat(),
+            hint_1_scheduled_at=schedules[1].isoformat(),
+            hint_2_scheduled_at=schedules[2].isoformat(),
+            hint_3_scheduled_at=schedules[3].isoformat(),
+        )
+        if not changed:
+            return False
+
+        refreshed = await db.get_round(round_id)
+        channel = self.get_channel(refreshed["channel_id"])
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(refreshed["channel_id"])
+            except discord.HTTPException:
+                channel = None
+
+        if isinstance(channel, discord.abc.Messageable):
+            embed = discord.Embed(
+                title=f"⚡ Le jeu s’accélère ! — Manche #{round_id}",
+                description=(
+                    "Une première bonne réponse a été validée. Son auteur reste secret jusqu’à la fin.\n\n"
+                    f"Les autres participants ont désormais jusqu’à <t:{int(effective_end.timestamp())}:F> "
+                    f"(<t:{int(effective_end.timestamp())}:R>) pour répondre.\n"
+                    "Les indices encore cachés sont rapprochés en conséquence."
+                ),
+                timestamp=accelerated_at,
+            )
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+        await self.update_scoreboard(refreshed["guild_id"])
+        # Publie immédiatement un indice dont l’horaire normal était déjà dépassé.
+        await self.publish_due_hints()
+        return True
+
     async def publish_due_hints(self) -> None:
         now = datetime.now(timezone.utc)
         for round_row in await db.open_rounds():
             if not round_has_hints(round_row):
                 continue
-            started = datetime.fromisoformat(round_row["started_at"])
-            for hint_number, day_offset in ((1, 2), (2, 4), (3, 6)):
+            for hint_number in (1, 2, 3):
                 if round_row[f"hint_{hint_number}_revealed_at"]:
                     continue
-                if now < started + timedelta(days=day_offset):
+                raw_due_at = round_row[f"hint_{hint_number}_scheduled_at"]
+                if not raw_due_at:
+                    started = datetime.fromisoformat(round_row["started_at"])
+                    due_at = started + timedelta(days=hint_number * 2)
+                else:
+                    due_at = datetime.fromisoformat(raw_due_at)
+                if now < due_at:
                     continue
 
                 channel = self.get_channel(round_row["channel_id"])
@@ -800,6 +919,11 @@ class ScoreBot(commands.Bot):
             f"✅ **{correct_count}** joueur{'s' if correct_count != 1 else ''} "
             f"{'ont' if correct_count != 1 else 'a'} trouvé",
         ]
+        if round_row["accelerated_at"]:
+            accelerated_dt = datetime.fromisoformat(round_row["accelerated_at"])
+            bilan_lines.append(
+                f"⚡ Mode accéléré déclenché <t:{int(accelerated_dt.timestamp())}:R>"
+            )
         if other_correct:
             bilan_lines.append(
                 f"👏 **{other_correct}** autre{'s' if other_correct != 1 else ''} bonne{'s' if other_correct != 1 else ''} "
@@ -836,7 +960,8 @@ async def help_command(interaction: discord.Interaction):
     text = [
         "**Règles en bref**",
         "• Utilisez **`/participer`** pour vous inscrire au jeu ; seuls les inscrits peuvent répondre et être tirés au sort.",
-        "• Une manche dure **7 jours** ; 3 indices sont publiés à **J+2, J+4 et J+6**.",
+        "• Une manche dure **7 jours maximum** ; 3 indices sont prévus à **J+2, J+4 et J+6**.",
+        "• Dès la **première bonne réponse validée**, la manche se termine sous **24 h maximum** et les indices restants sont accélérés.",
         "• Les réponses restent privées et sont validées par le meneur.",
         "• Podium : **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2**, et **3/2/1** après le 3e.",
         "• Si personne ne trouve : **+4 pts au meneur**.",

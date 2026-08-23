@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -59,6 +59,11 @@ class Database:
                     hint_1_revealed_at TEXT,
                     hint_2_revealed_at TEXT,
                     hint_3_revealed_at TEXT,
+                    hint_1_scheduled_at TEXT,
+                    hint_2_scheduled_at TEXT,
+                    hint_3_scheduled_at TEXT,
+                    accelerated_at TEXT,
+                    original_ends_at TEXT,
                     started_at TEXT NOT NULL,
                     ends_at TEXT NOT NULL,
                     closed_at TEXT,
@@ -112,9 +117,39 @@ class Database:
                 ("hint_1_revealed_at", "TEXT"),
                 ("hint_2_revealed_at", "TEXT"),
                 ("hint_3_revealed_at", "TEXT"),
+                ("hint_1_scheduled_at", "TEXT"),
+                ("hint_2_scheduled_at", "TEXT"),
+                ("hint_3_scheduled_at", "TEXT"),
+                ("accelerated_at", "TEXT"),
+                ("original_ends_at", "TEXT"),
             ):
                 if column not in round_columns:
                     await db.execute(f"ALTER TABLE rounds ADD COLUMN {column} {definition}")
+
+            # Initialise les nouveaux horaires sur les manches déjà présentes.
+            # Pour les anciennes manches, ends_at correspond à la limite historique J+7.
+            existing_rounds = await (await db.execute(
+                """
+                SELECT id, started_at, ends_at, original_ends_at,
+                       hint_1_scheduled_at, hint_2_scheduled_at, hint_3_scheduled_at
+                FROM rounds
+                """
+            )).fetchall()
+            for row in existing_rounds:
+                started = datetime.fromisoformat(row["started_at"])
+                original_ends_at = row["original_ends_at"] or row["ends_at"]
+                hint_1_at = row["hint_1_scheduled_at"] or (started + timedelta(days=2)).isoformat()
+                hint_2_at = row["hint_2_scheduled_at"] or (started + timedelta(days=4)).isoformat()
+                hint_3_at = row["hint_3_scheduled_at"] or (started + timedelta(days=6)).isoformat()
+                await db.execute(
+                    """
+                    UPDATE rounds
+                    SET original_ends_at = ?,
+                        hint_1_scheduled_at = ?, hint_2_scheduled_at = ?, hint_3_scheduled_at = ?
+                    WHERE id = ?
+                    """,
+                    (original_ends_at, hint_1_at, hint_2_at, hint_3_at, row["id"]),
+                )
 
             await db.commit()
 
@@ -311,18 +346,25 @@ class Database:
         hint_3: str,
         started_at: str,
         ends_at: str,
+        hint_1_scheduled_at: str,
+        hint_2_scheduled_at: str,
+        hint_3_scheduled_at: str,
     ) -> int:
         async with self.connection() as db:
             cursor = await db.execute(
                 """
                 INSERT INTO rounds(
                     guild_id, channel_id, master_id, solution, image_url,
-                    hint_1, hint_2, hint_3, started_at, ends_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+                    hint_1, hint_2, hint_3,
+                    hint_1_scheduled_at, hint_2_scheduled_at, hint_3_scheduled_at,
+                    started_at, ends_at, original_ends_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
                 """,
                 (
                     guild_id, channel_id, master_id, solution, image_url,
-                    hint_1, hint_2, hint_3, started_at, ends_at,
+                    hint_1, hint_2, hint_3,
+                    hint_1_scheduled_at, hint_2_scheduled_at, hint_3_scheduled_at,
+                    started_at, ends_at, ends_at,
                 ),
             )
             await db.commit()
@@ -354,6 +396,36 @@ class Database:
             cursor = await db.execute(
                 f"UPDATE rounds SET {column} = ? WHERE id = ? AND {column} IS NULL",
                 (revealed_at, round_id),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def accelerate_round(
+        self,
+        round_id: int,
+        accelerated_at: str,
+        ends_at: str,
+        hint_1_scheduled_at: str,
+        hint_2_scheduled_at: str,
+        hint_3_scheduled_at: str,
+    ) -> bool:
+        """Active le mode accéléré une seule fois pour une manche encore ouverte."""
+        async with self.connection() as db:
+            cursor = await db.execute(
+                """
+                UPDATE rounds
+                SET accelerated_at = ?,
+                    ends_at = ?,
+                    hint_1_scheduled_at = ?,
+                    hint_2_scheduled_at = ?,
+                    hint_3_scheduled_at = ?
+                WHERE id = ? AND status = 'open' AND accelerated_at IS NULL
+                """,
+                (
+                    accelerated_at, ends_at,
+                    hint_1_scheduled_at, hint_2_scheduled_at, hint_3_scheduled_at,
+                    round_id,
+                ),
             )
             await db.commit()
             return cursor.rowcount == 1
