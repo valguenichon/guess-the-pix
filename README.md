@@ -2,17 +2,6 @@
 
 Bot Discord pour un jeu hebdomadaire de découverte de jeux vidéo à partir d’une capture d’écran.
 
-## Configuration de ce serveur
-
-Le projet est préconfiguré pour :
-
-- serveur Discord : `719108810081304617`
-- canal du jeu : `1539974418590339103`
-- rôle **Admin du jeu** : `1540752051783475372`
-- durée d’une manche : exactement `7 × 24 h` après son lancement
-
-Ces valeurs sont dans `.env.example`. Le token du bot n’est volontairement pas inclus.
-
 ## Règles implémentées
 
 - Le meneur lance une manche avec `/lancer` en joignant une image ou en fournissant une URL publique d’image.
@@ -138,9 +127,9 @@ par le vrai token.
 Les autres paramètres sont déjà renseignés :
 
 ```text
-GUILD_ID=719108810081304617
-GAME_CHANNEL_ID=1539974418590339103
-GAME_ADMIN_ROLE_ID=1540752051783475372
+GUILD_ID=
+GAME_CHANNEL_ID=
+GAME_ADMIN_ROLE_ID=
 DATABASE_PATH=data/scoreboard.db
 ROUND_DURATION_DAYS=7
 ```
