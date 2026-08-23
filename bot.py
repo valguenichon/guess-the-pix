@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.11.0-accelerated"
+BOT_VERSION = "0.11.1-buttons"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -157,6 +157,172 @@ async def random_registered_participant(guild: discord.Guild, excluded: set[int]
 
     import random
     return random.choice(eligible)
+
+
+def build_help_text(interaction: discord.Interaction) -> str:
+    text = [
+        "**Règles en bref**",
+        "• Utilisez **`/participer`** pour vous inscrire au jeu ; seuls les inscrits peuvent répondre et être tirés au sort.",
+        "• Une manche dure **7 jours maximum** ; 3 indices sont prévus à **J+2, J+4 et J+6**.",
+        "• Dès la **première bonne réponse validée**, la manche se termine sous **24 h maximum** et les indices restants sont accélérés.",
+        "• Les réponses restent privées et sont validées par le meneur.",
+        "• Podium : **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2**, et **3/2/1** après le 3e.",
+        "• Si personne ne trouve : **+4 pts au meneur**.",
+        "• Le 1er devient meneur suivant ; s’il passe, tirage hors gagnant et meneur sortant. Sans gagnant, tirage parmi les inscrits hors meneur sortant.",
+        "",
+        "**Commandes joueurs**",
+        "`/participer` — s’inscrire au jeu",
+        "`/quitter` — se désinscrire du jeu",
+        "`/reponse` — proposer une réponse secrète (participants inscrits uniquement)",
+        "`/score` — afficher le classement ; avec un joueur, afficher ses statistiques",
+        "`/meneur` — afficher le meneur actuel",
+        "`/historique` — afficher les dernières manches",
+        "",
+        "**Boutons des manches**",
+        "🎮 **Participer** — s’inscrire directement",
+        "💡 **Répondre** — accéder à la commande `/reponse`",
+        "🏆 **Classement** — consulter le classement en privé",
+        "❓ **Aide** — afficher cette aide en privé",
+        "",
+        "**Commandes du meneur**",
+        "`/lancer image:...` ou `/lancer url:...` — lancer une manche et saisir ses 3 indices",
+        "`/passe` — passer la main avant de lancer la manche",
+    ]
+    if is_admin(interaction):
+        text += [
+            "",
+            "**Administration**",
+            "`/designer @joueur` — désigner le meneur",
+            "`/corriger @joueur points:` — corriger le score",
+            "`/cloturer` — clôturer immédiatement la manche",
+            "`/tableau` — créer ou actualiser le scoreboard permanent",
+            "`/reinitialiser` — remettre entièrement le jeu à zéro",
+        ]
+    return "\n".join(text)
+
+
+async def build_leaderboard_embed(guild_id: int) -> discord.Embed:
+    rows = await db.leaderboard(guild_id)
+    if not rows:
+        return discord.Embed(
+            title="🏆 Scoreboard",
+            description="Le classement est encore vide.",
+        )
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, row in enumerate(rows):
+        prefix = medals[i] if i < 3 else f"**{i + 1}.**"
+        lines.append(
+            f"{prefix} <@{row['user_id']}> — **{row['score']} pt{'s' if row['score'] != 1 else ''}**"
+        )
+    return discord.Embed(title="🏆 Scoreboard", description="\n".join(lines))
+
+
+class RoundActionsView(discord.ui.View):
+    """Boutons persistants affichés sous chaque message de manche."""
+
+    def __init__(self, bot: "ScoreBot"):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    async def _check_context(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Ces boutons sont disponibles uniquement sur le serveur.",
+                ephemeral=True,
+            )
+            return False
+        if not game_channel_ok(interaction):
+            await interaction.response.send_message(
+                "Cette action doit être utilisée dans le canal du jeu.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Participer",
+        emoji="🎮",
+        style=discord.ButtonStyle.success,
+        custom_id="round_action:join",
+    )
+    async def participate(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check_context(interaction):
+            return
+        if await db.is_participant_active(interaction.guild_id, interaction.user.id):
+            await interaction.response.send_message("Tu participes déjà.", ephemeral=True)
+            return
+
+        await db.set_participant(interaction.guild_id, interaction.user.id, True)
+        await interaction.response.send_message(
+            "✅ Tu participes maintenant au jeu. Tu peux utiliser `/reponse` pendant les manches et tu es éligible aux tirages au sort.",
+            ephemeral=True,
+        )
+        await self.bot.update_scoreboard(interaction.guild_id)
+
+    @discord.ui.button(
+        label="Répondre",
+        emoji="💡",
+        style=discord.ButtonStyle.primary,
+        custom_id="round_action:answer",
+    )
+    async def answer(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check_context(interaction):
+            return
+        if not await db.is_participant_active(interaction.guild_id, interaction.user.id):
+            participate = self.bot.command_mention("participer")
+            await interaction.response.send_message(
+                f"Tu dois d’abord t’inscrire avec {participate}.",
+                ephemeral=True,
+            )
+            return
+
+        round_row = await db.get_open_round(interaction.guild_id)
+        if not round_row:
+            await interaction.response.send_message(
+                "Aucune manche n’est actuellement ouverte.",
+                ephemeral=True,
+            )
+            return
+        if datetime.fromisoformat(round_row["ends_at"]) <= datetime.now(timezone.utc):
+            await interaction.response.send_message("Le délai de réponse est terminé.", ephemeral=True)
+            return
+        if interaction.user.id == round_row["master_id"]:
+            await interaction.response.send_message(
+                "Le meneur ne peut pas répondre à sa propre manche.",
+                ephemeral=True,
+            )
+            return
+
+        answer_command = self.bot.command_mention("reponse")
+        await interaction.response.send_message(
+            f"💡 Utilise {answer_command} pour proposer secrètement le nom du jeu.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Classement",
+        emoji="🏆",
+        style=discord.ButtonStyle.secondary,
+        custom_id="round_action:score",
+    )
+    async def leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check_context(interaction):
+            return
+        embed = await build_leaderboard_embed(interaction.guild_id)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(
+        label="Aide",
+        emoji="❓",
+        style=discord.ButtonStyle.secondary,
+        custom_id="round_action:help",
+    )
+    async def help(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check_context(interaction):
+            return
+        await interaction.response.send_message(build_help_text(interaction), ephemeral=True)
 
 
 class ValidationView(discord.ui.View):
@@ -310,14 +476,18 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             title=f"🎮 Manche #{round_id}",
             description=(
                 f"Proposée par {interaction.user.mention}\n"
-                f"**Pour participer :** inscrivez-vous avec **`/participer`**, puis utilisez **`/reponse`**.\n"
+                f"**Pour participer :** utilisez les boutons ci-dessous, ou **`/participer`** puis **`/reponse`**.\n"
                 f"💡 Trois indices sont prévus à **J+2, J+4 et J+6**.\n"
                 f"⚡ Dès la première bonne réponse validée, il restera **24 h maximum** et les indices encore cachés seront rapprochés.\n\n"
                 f"Fin maximale : <t:{int(ends.timestamp())}:F> — <t:{int(ends.timestamp())}:R>"
             ),
         )
         embed.set_image(url=f"attachment://{upload_file.filename}")
-        await interaction.response.send_message(embed=embed, file=upload_file)
+        await interaction.response.send_message(
+            embed=embed,
+            file=upload_file,
+            view=RoundActionsView(self.bot),
+        )
 
         try:
             message = await interaction.original_response()
@@ -333,9 +503,15 @@ class ScoreBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         super().__init__(command_prefix="!", intents=intents)
+        self.command_mentions: dict[str, str] = {}
+
+    def command_mention(self, name: str) -> str:
+        return self.command_mentions.get(name, f"`/{name}`")
 
     async def setup_hook(self) -> None:
         await db.init()
+        # Vue persistante : les boutons des anciennes manches restent actifs après redémarrage.
+        self.add_view(RoundActionsView(self))
         logger.warning("Scoreboard bot version %s", BOT_VERSION)
 
         if config.guild_id:
@@ -346,6 +522,11 @@ class ScoreBot(commands.Bot):
             # les synchronise. Cela remplace aussi les anciennes commandes de guilde.
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
+            self.command_mentions = {
+                command.name: f"</{command.name}:{command.id}>"
+                for command in synced
+                if command.id
+            }
             logger.warning(
                 "Commandes synchronisees sur le serveur %s : %s",
                 config.guild_id,
@@ -360,6 +541,11 @@ class ScoreBot(commands.Bot):
             logger.warning("Anciennes commandes globales supprimees.")
         else:
             synced = await self.tree.sync()
+            self.command_mentions = {
+                command.name: f"</{command.name}:{command.id}>"
+                for command in synced
+                if command.id
+            }
             logger.warning(
                 "Commandes globales synchronisees : %s",
                 ", ".join(sorted(command.name for command in synced)),
@@ -957,39 +1143,7 @@ def game_channel_ok(interaction: discord.Interaction) -> bool:
 
 @bot.tree.command(name="aide", description="Afficher les commandes du jeu")
 async def help_command(interaction: discord.Interaction):
-    text = [
-        "**Règles en bref**",
-        "• Utilisez **`/participer`** pour vous inscrire au jeu ; seuls les inscrits peuvent répondre et être tirés au sort.",
-        "• Une manche dure **7 jours maximum** ; 3 indices sont prévus à **J+2, J+4 et J+6**.",
-        "• Dès la **première bonne réponse validée**, la manche se termine sous **24 h maximum** et les indices restants sont accélérés.",
-        "• Les réponses restent privées et sont validées par le meneur.",
-        "• Podium : **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2**, et **3/2/1** après le 3e.",
-        "• Si personne ne trouve : **+4 pts au meneur**.",
-        "• Le 1er devient meneur suivant ; s’il passe, tirage hors gagnant et meneur sortant. Sans gagnant, tirage parmi les inscrits hors meneur sortant.",
-        "",
-        "**Commandes joueurs**",
-        "`/participer` — s’inscrire au jeu",
-        "`/quitter` — se désinscrire du jeu",
-        "`/reponse` — proposer une réponse secrète (participants inscrits uniquement)",
-        "`/score` — afficher le classement ; avec un joueur, afficher ses statistiques",
-        "`/meneur` — afficher le meneur actuel",
-        "`/historique` — afficher les dernières manches",
-        "",
-        "**Commandes du meneur**",
-        "`/lancer image:...` ou `/lancer url:...` — lancer une manche et saisir ses 3 indices",
-        "`/passe` — passer la main avant de lancer la manche",
-    ]
-    if is_admin(interaction):
-        text += [
-            "",
-            "**Administration**",
-            "`/designer @joueur` — désigner le meneur",
-            "`/corriger @joueur points:` — corriger le score",
-            "`/cloturer` — clôturer immédiatement la manche",
-            "`/tableau` — créer ou actualiser le scoreboard permanent",
-            "`/reinitialiser` — remettre entièrement le jeu à zéro",
-        ]
-    await interaction.response.send_message("\n".join(text), ephemeral=True)
+    await interaction.response.send_message(build_help_text(interaction), ephemeral=True)
 
 
 @bot.tree.command(name="designer", description="Désigner manuellement le prochain meneur")
@@ -1205,16 +1359,8 @@ async def score(interaction: discord.Interaction, joueur: discord.Member | None 
         embed.add_field(name="Introuvables", value=str(stats['unfound']), inline=True)
         await interaction.response.send_message(embed=embed)
         return
-    rows = await db.leaderboard(interaction.guild_id)
-    if not rows:
-        await interaction.response.send_message("Le classement est encore vide.")
-        return
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, row in enumerate(rows):
-        prefix = medals[i] if i < 3 else f"**{i + 1}.**"
-        lines.append(f"{prefix} <@{row['user_id']}> — **{row['score']} pt{'s' if row['score'] != 1 else ''}**")
-    await interaction.response.send_message(embed=discord.Embed(title="🏆 Scoreboard", description="\n".join(lines)))
+    embed = await build_leaderboard_embed(interaction.guild_id)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="corriger", description="Ajouter ou retirer des points")

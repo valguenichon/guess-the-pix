@@ -2,23 +2,43 @@
 
 Bot Discord pour un jeu hebdomadaire de découverte de jeux vidéo à partir d’une capture d’écran.
 
+## Configuration de ce serveur
+
+Le projet est préconfiguré pour :
+
+- serveur Discord : `719108810081304617`
+- canal du jeu : `1539974418590339103`
+- rôle **Admin du jeu** : `1540752051783475372`
+- durée d’une manche : exactement `7 × 24 h` après son lancement
+
+Ces valeurs sont dans `.env.example`. Le token du bot n’est volontairement pas inclus.
+
 ## Règles implémentées
 
-- Le meneur lance une manche avec `/lancer` et joint une capture d’écran.
-- Il saisit le nom du jeu dans un formulaire privé au lancement.
-- La manche reste ouverte exactement 7 jours (168 heures).
-- Seuls les membres possédant au moins un des deux rôles participants peuvent répondre.
-- Les joueurs répondent directement avec `/reponse réponse:` ; le texte de la réponse n’est jamais publié dans le canal.
+- Le meneur lance une manche avec `/lancer` en joignant une image ou en fournissant une URL publique d’image.
+- Il saisit le nom du jeu et trois indices dans un formulaire privé au lancement.
+- La manche reste ouverte **7 jours maximum** (168 heures).
+- Les utilisateurs s’inscrivent avec `/participer`. Seuls les participants inscrits peuvent répondre et être tirés au sort.
+- Chaque nouveau message de manche propose quatre boutons persistants : **🎮 Participer**, **💡 Répondre**, **🏆 Classement** et **❓ Aide**.
+- **Participer** inscrit directement le membre ; si celui-ci est déjà inscrit, le bot le lui indique en privé.
+- **Répondre** renvoie en privé vers la commande `/reponse` ; le texte de la réponse reste saisi via la commande slash.
+- **Classement** et **Aide** affichent leurs informations en réponse éphémère sans encombrer le salon.
+- Les joueurs répondent directement avec `/reponse` ; le texte de la réponse n’est jamais publié dans le canal.
 - Chaque tentative déclenche immédiatement un message privé au meneur avec les boutons **Valider** et **Invalider**.
 - Le joueur sait seulement que sa réponse a été examinée ; le verdict reste secret jusqu’à la clôture.
 - Plusieurs tentatives sont possibles.
 - Pour chaque joueur, l’heure de sa première tentative validée correcte détermine son rang.
-- À J+7, les nouvelles réponses sont bloquées.
-- S’il reste des réponses en attente de validation à J+7, le résultat attend leur arbitrage par le meneur.
-- À la fin : 3 points au premier, 2 au deuxième et 1 au troisième.
-- Si personne ne trouve, le meneur gagne 2 points.
+- Tant qu’aucune bonne réponse n’est validée, les trois indices sont prévus à J+2, J+4 et J+6 et la manche se termine à J+7.
+- Dès la **première bonne réponse validée**, le jeu passe en **mode accéléré** : la nouvelle échéance est fixée à 24 heures maximum après cette validation, sans jamais dépasser J+7.
+- Les indices encore cachés sont alors répartis dans le temps restant et peuvent être publiés plus tôt ; un indice n’est jamais repoussé par l’accélération.
+- Le déclenchement des 24 h repose sur l’heure de validation, tandis que le classement et le scoring conservent l’heure d’envoi réelle de chaque réponse.
+- À l’échéance effective, les nouvelles réponses sont bloquées.
+- S’il reste des réponses en attente de validation, le résultat attend leur arbitrage par le meneur.
+- Le podium vaut **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2** et enfin **3/2/1** après le troisième indice.
+- Le barème appliqué dépend des indices réellement publiés au moment de la première bonne réponse de chaque joueur.
+- Si personne ne trouve, le meneur gagne **4 points**.
 - Le premier devient le prochain meneur.
-- S’il utilise `/passe`, un membre est tiré au sort parmi les deux rôles participants en excluant le gagnant et le meneur de la manche précédente.
+- S’il utilise `/passe`, un participant inscrit est tiré au sort en excluant le gagnant et le meneur de la manche précédente.
 - Si personne n’a trouvé, le prochain meneur est tiré automatiquement en excluant le meneur sortant.
 - Les comptes bots sont toujours exclus des tirages.
 
@@ -27,7 +47,9 @@ Bot Discord pour un jeu hebdomadaire de découverte de jeux vidéo à partir d�
 ### Joueurs
 
 - `/aide` — afficher les commandes disponibles
-- `/reponse réponse:` — envoyer une réponse secrète au meneur
+- `/participer` — s’inscrire au jeu
+- `/quitter` — se désinscrire du jeu sans effacer son historique ni ses scores
+- `/reponse` — envoyer une réponse secrète au meneur ; réservé aux participants inscrits
 - `/score` — afficher le classement général
 - `/score @joueur` — afficher le score d’un joueur
 - `/meneur` — afficher le meneur actuel
@@ -35,16 +57,27 @@ Bot Discord pour un jeu hebdomadaire de découverte de jeux vidéo à partir d�
 
 ### Meneur
 
-- `/lancer capture:` — lancer une manche avec une capture d’écran
+- `/lancer image:...` ou `/lancer url:...` — lancer une manche et saisir les trois indices
 - `/passe` — passer la main avant le lancement de sa manche et déclencher un tirage
 
 ### Administration
 
 Ces commandes sont accessibles aux membres possédant le rôle **Admin du jeu** (`1540752051783475372`). Par sécurité, les membres ayant la permission Discord **Administrateur** ou **Gérer le serveur** y ont également accès :
 
-- `/designer @joueur` — désigner manuellement le prochain meneur ; le membre doit avoir un rôle participant
+- `/designer @joueur` — désigner manuellement le prochain meneur ; le membre doit être inscrit au jeu
 - `/corriger @joueur points:` — ajouter ou retirer des points
 - `/cloturer` — fermer immédiatement les réponses ; les résultats ne sont publiés qu’après validation des réponses encore en attente
+
+### Boutons persistants des manches
+
+Sous chaque nouveau message de manche :
+
+- **🎮 Participer** — équivalent direct de `/participer`
+- **💡 Répondre** — affiche en privé un lien vers `/reponse`
+- **🏆 Classement** — affiche le classement général en privé
+- **❓ Aide** — affiche `/aide` en privé
+
+Les boutons utilisent des identifiants stables et leur vue est réenregistrée au démarrage du bot. Ils continuent donc à fonctionner après un redémarrage du conteneur.
 
 ## Installation
 
@@ -55,9 +88,10 @@ Python 3.11 ou plus récent est recommandé.
 Dans le Discord Developer Portal :
 
 1. créer ou ouvrir l’application du bot ;
-2. dans **Bot**, activer **Server Members Intent** ; cet intent est nécessaire pour que le tirage puisse lire de manière fiable les membres portant les rôles participants ;
-3. récupérer le token du bot ;
-4. ne jamais publier ou partager ce token.
+2. récupérer le token du bot ;
+3. ne jamais publier ou partager ce token.
+
+Le bot n’utilise plus les rôles Discord pour gérer les participants et ne nécessite donc plus **Server Members Intent** pour cette fonction.
 
 ### 2. Inviter le bot sur le serveur
 
@@ -101,13 +135,12 @@ DISCORD_TOKEN=collez_ici_le_token_du_bot
 
 par le vrai token.
 
-Les autres paramètres :
+Les autres paramètres sont déjà renseignés :
 
 ```text
-GUILD_ID= ID du serveur Discord
-GAME_CHANNEL_ID= ID du salon de jeu
-PARTICIPANT_ROLE_IDS= ID des rôles autorisés à participer
-GAME_ADMIN_ROLE_ID= ID du rôle admin du jeu
+GUILD_ID=719108810081304617
+GAME_CHANNEL_ID=1539974418590339103
+GAME_ADMIN_ROLE_ID=1540752051783475372
 DATABASE_PATH=data/scoreboard.db
 ROUND_DURATION_DAYS=7
 ```
@@ -124,11 +157,12 @@ Au démarrage, les slash commands sont synchronisées directement sur le serveur
 
 1. Démarrer le bot.
 2. Dans le canal du jeu, utiliser `/aide`.
-3. Un membre ayant le rôle **Admin du jeu** utilise `/designer @joueur` pour choisir le premier meneur.
-4. Le meneur utilise `/lancer` et joint une capture.
-5. Un autre membre ayant l’un des rôles participants utilise `/reponse réponse:`.
-6. Vérifier que le meneur reçoit bien le DM avec **Valider / Invalider**.
-7. Pour tester sans attendre une semaine, un **Admin du jeu** peut utiliser `/cloturer`.
+3. Les joueurs souhaitant participer utilisent `/participer`.
+4. Un membre ayant le rôle **Admin du jeu** utilise `/designer @joueur` pour choisir le premier meneur parmi les participants inscrits.
+5. Le meneur utilise `/lancer`, fournit une image ou une URL, puis saisit le jeu et les trois indices. La manche dure 7 jours maximum et s’accélère à 24 h maximum dès la première bonne réponse validée.
+6. Un autre participant utilise `/reponse`.
+7. Vérifier que le meneur reçoit bien le DM avec **Valider / Invalider**.
+8. Pour tester sans attendre une semaine, un **Admin du jeu** peut utiliser `/cloturer`.
 
 ## Données
 
@@ -165,7 +199,7 @@ Un administrateur du jeu peut utiliser `/tableau` dans le canal configuré. Le b
 
 ## v0.7.0 — Résultats de manche
 
-À la clôture, le bot publie désormais un résultat détaillé : jeu révélé, capture, podium 3/2/1, temps écoulé avant chaque bonne réponse du podium, nombre de participants, nombre de tentatives, nombre total de joueurs ayant trouvé et prochain meneur. Si personne ne trouve, le bonus de 2 points du meneur et le tirage du prochain meneur sont indiqués explicitement.
+Depuis la v0.7.0, la clôture publie un résultat détaillé : jeu révélé, capture, podium, temps écoulé avant chaque bonne réponse du podium, nombre de participants, nombre de tentatives, nombre total de joueurs ayant trouvé et prochain meneur. Le barème actuel est décrit dans la section de la version la plus récente ci-dessous.
 
 
 ## Version 0.7.1 — terminologie
@@ -181,3 +215,47 @@ La commande `/aide` affiche désormais un résumé court des règles du jeu.
 ## Réinitialisation complète
 
 La commande admin `/reinitialiser` affiche une confirmation avant d'effacer les scores, l'historique, les manches, les tentatives et le meneur. Le scoreboard permanent est conservé et actualisé à vide. Lorsque les tables sont entièrement vides, la numérotation des manches repart à #1.
+
+
+## Version 0.9.0 — indices progressifs
+
+- Le meneur saisit trois indices lors du lancement de la manche.
+- Ils sont publiés automatiquement à J+2, J+4 et J+6.
+- Le barème du podium évolue selon le nombre d’indices déjà révélés : 6/5/4, puis 5/4/3, 4/3/2 et 3/2/1.
+- Le moment réellement enregistré de publication des indices sert au calcul, afin de rester équitable après une éventuelle indisponibilité du bot.
+- Si personne ne trouve au bout de 7 jours, le meneur gagne 4 points.
+- Le scoreboard indique le nombre d’indices révélés et le délai avant le prochain indice.
+
+
+## Version 0.10.0 — inscription volontaire
+
+- Le salon reste visible à tous, mais seuls les utilisateurs inscrits avec `/participer` peuvent utiliser `/reponse`.
+- `/quitter` désactive la participation sans effacer les scores ni l’historique du joueur.
+- Les tirages aléatoires utilisent uniquement les participants actuellement inscrits.
+- Un meneur ne peut pas quitter le jeu pendant sa manche ; s’il est désigné pour la manche suivante, il doit d’abord utiliser `/passe`.
+- `/designer` ne peut désigner qu’un participant inscrit.
+- Le scoreboard affiche désormais le nombre de participants inscrits.
+- `/aide` présente le parcours d’inscription et les nouvelles commandes.
+- Les anciens `PARTICIPANT_ROLE_IDS` ne sont plus utilisés.
+
+
+## Version 0.11.0 — mode accéléré
+
+- Une manche conserve une durée maximale de 7 jours.
+- La première réponse validée correcte déclenche automatiquement le **mode accéléré**.
+- La nouvelle fin est fixée à **24 heures maximum après cette validation**, sans jamais dépasser la fin initiale à J+7.
+- Les indices non encore révélés sont redistribués uniformément dans le temps restant ; leur horaire normal J+2/J+4/J+6 reste prioritaire s’il est plus proche.
+- Les horaires réellement publiés des indices continuent de déterminer le barème 6/5/4 → 5/4/3 → 4/3/2 → 3/2/1.
+- Le podium reste classé selon l’heure d’envoi des réponses, indépendamment de l’ordre dans lequel le meneur les valide.
+- Un message public anonyme annonce le passage en mode accéléré et sa nouvelle échéance.
+- Le scoreboard affiche le mode accéléré, la nouvelle fin et le prochain indice recalculé.
+
+## Version 0.11.1 — boutons de manche
+
+- Chaque nouveau message de manche affiche quatre boutons persistants : **Participer**, **Répondre**, **Classement** et **Aide**.
+- **Participer** inscrit immédiatement le membre et répond « Tu participes déjà. » si nécessaire.
+- **Répondre** renvoie en privé vers la commande `/reponse` tout en conservant la saisie via slash command.
+- **Classement** affiche le scoreboard en réponse éphémère.
+- **Aide** affiche la même aide que `/aide` en réponse éphémère.
+- Les boutons restent actifs après un redémarrage du bot grâce aux vues persistantes Discord.
+
