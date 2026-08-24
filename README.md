@@ -38,6 +38,7 @@ Bot Discord pour un jeu hebdomadaire de découverte de jeux vidéo à partir d�
 - `/aide` — afficher les commandes disponibles
 - `/participer` — s’inscrire au jeu
 - `/quitter` — se désinscrire du jeu sans effacer son historique ni ses scores
+- `/participants` — afficher la liste des participants actifs ; le meneur actuel est identifié
 - `/reponse` — envoyer une réponse secrète au meneur ; réservé aux participants inscrits
 - `/score` — afficher le classement général
 - `/score @joueur` — afficher le score d’un joueur
