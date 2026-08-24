@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.11.1-buttons"
+BOT_VERSION = "0.11.2-participants"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -173,6 +173,7 @@ def build_help_text(interaction: discord.Interaction) -> str:
         "**Commandes joueurs**",
         "`/participer` — s’inscrire au jeu",
         "`/quitter` — se désinscrire du jeu",
+        "`/participants` — afficher la liste des participants inscrits",
         "`/reponse` — proposer une réponse secrète (participants inscrits uniquement)",
         "`/score` — afficher le classement ; avec un joueur, afficher ses statistiques",
         "`/meneur` — afficher le meneur actuel",
@@ -1264,6 +1265,40 @@ async def leave_game(interaction: discord.Interaction):
         ephemeral=True,
     )
     await bot.update_scoreboard(interaction.guild_id)
+
+
+@bot.tree.command(name="participants", description="Afficher les participants inscrits")
+async def list_participants(interaction: discord.Interaction):
+    if interaction.guild_id is None or interaction.guild is None:
+        await interaction.response.send_message("Commande disponible uniquement sur le serveur.", ephemeral=True)
+        return
+    if not game_channel_ok(interaction):
+        await interaction.response.send_message("Cette commande doit être utilisée dans le canal du jeu.", ephemeral=True)
+        return
+
+    participant_ids = await db.active_participant_ids(interaction.guild_id)
+    if not participant_ids:
+        await interaction.response.send_message("Aucun participant n’est actuellement inscrit au jeu.")
+        return
+
+    state = await db.get_state(interaction.guild_id)
+    current_master_id = state["current_master_id"]
+
+    lines: list[str] = []
+    for user_id in participant_ids:
+        suffix = " — 🎮 **meneur**" if user_id == current_master_id else ""
+        lines.append(f"<@{user_id}>{suffix}")
+
+    embed = discord.Embed(
+        title=f"👥 Participants inscrits — {len(participant_ids)}",
+        description="\n".join(lines[:100]),
+    )
+    if len(lines) > 100:
+        embed.set_footer(text=f"{len(lines) - 100} participant(s) supplémentaire(s) non affiché(s).")
+    elif current_master_id:
+        embed.set_footer(text="Le meneur actuel est indiqué dans la liste.")
+
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="reponse", description="Envoyer une réponse secrète au meneur")
