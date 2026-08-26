@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.11.3-round-message-ui"
+BOT_VERSION = "0.12.1-help-settings"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -159,65 +159,126 @@ async def random_registered_participant(guild: discord.Guild, excluded: set[int]
     return random.choice(eligible)
 
 
-def build_help_text(interaction: discord.Interaction) -> str:
-    text = [
+async def build_help_text(interaction: discord.Interaction) -> str:
+    settings: list[str] = []
+    if interaction.guild_id is not None:
+        state = await db.get_state(interaction.guild_id)
+        period = await db.get_current_period(interaction.guild_id)
+        progress, period_limit = await db.period_progress(period["id"])
+        active_round = await db.get_active_round(interaction.guild_id)
+
+        if active_round is not None:
+            attempt_limit = active_round["attempt_limit"]
+            attempt_label = (
+                "**illimités** pour la manche en cours"
+                if attempt_limit is None
+                else f"**{attempt_limit} par joueur** pour la manche en cours"
+            )
+        else:
+            attempt_limit = state["default_attempt_limit"]
+            attempt_label = (
+                "**illimités**"
+                if attempt_limit is None
+                else f"**{attempt_limit} par joueur**"
+            )
+
+        if period_limit is None:
+            period_label = f"**Période {period['number']}** — sans limite de manches"
+        else:
+            period_label = f"**Période {period['number']}** — **{progress}/{period_limit} manches**"
+
+        settings = [
+            "**Paramètres actuels**",
+            f"🎯 Essais : {attempt_label}",
+            f"🗓️ Classement : {period_label}",
+            "⏱️ Durée maximale d’une manche : **7 jours**",
+            "⚡ Accélération : **24 h maximum après la première bonne réponse validée**",
+            "",
+        ]
+
+    text = settings + [
         "**Règles en bref**",
-        "• Utilisez **`/participer`** pour vous inscrire au jeu ; seuls les inscrits peuvent répondre et être tirés au sort.",
-        "• Une manche dure **7 jours maximum** ; 3 indices sont prévus à **J+2, J+4 et J+6**.",
-        "• Dès la **première bonne réponse validée**, la manche se termine sous **24 h maximum** et les indices restants sont accélérés.",
-        "• Les réponses restent privées et sont validées par le meneur.",
+        "• **`/participer`** est requis pour répondre et être tiré au sort.",
+        "• Manche : **7 jours max**, indices à **J+2/J+4/J+6** ; après la 1re bonne réponse validée, fin sous **24 h max**.",
+        "• Le nombre d’essais peut être **illimité** ou limité pour chaque manche.",
+        "• Après validation, le verdict est envoyé en privé.",
         "• Podium : **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2**, et **3/2/1** après le 3e.",
         "• Si personne ne trouve : **+4 pts au meneur**.",
-        "• Le 1er devient meneur suivant ; s’il passe, tirage hors gagnant et meneur sortant. Sans gagnant, tirage parmi les inscrits hors meneur sortant.",
+        "• Le 1er devient meneur ; s’il passe, tirage parmi les participants inscrits.",
+        "• Classement par **périodes** ; `/score` affiche la période en cours.",
+        "",
+        "**Commandes du meneur**",
+        "`/lancer image:...` ou `/lancer url:...` — lancer une manche et saisir ses 3 indices",
+        "`/passe` — passer la main avant de lancer la manche",
         "",
         "**Commandes joueurs**",
         "`/participer` — s’inscrire au jeu",
         "`/quitter` — se désinscrire du jeu",
         "`/participants` — afficher la liste des participants inscrits",
-        "`/reponse` — proposer une réponse secrète (participants inscrits uniquement)",
-        "`/score` — afficher le classement ; avec un joueur, afficher ses statistiques",
+        "`/reponse` — proposer une réponse secrète",
+        "`/score` — classement de la période actuelle ou d’une période choisie",
+        "`/score-global` — classement toutes périodes confondues",
+        "`/periodes` — afficher les périodes disponibles",
         "`/meneur` — afficher le meneur actuel",
         "`/historique` — afficher les dernières manches",
-        "",
-        "**Boutons des manches**",
-        "🎮 **Participer** — s’inscrire directement",
-        "💡 **Répondre** — accéder à la commande `/reponse`",
-        "🏆 **Classement** — consulter le classement en privé",
-        "❓ **Aide** — afficher cette aide en privé",
-        "",
-        "**Commandes du meneur**",
-        "`/lancer image:...` ou `/lancer url:...` — lancer une manche et saisir ses 3 indices",
-        "`/passe` — passer la main avant de lancer la manche",
     ]
     if is_admin(interaction):
         text += [
             "",
             "**Administration**",
             "`/designer @joueur` — désigner le meneur",
-            "`/corriger @joueur points:` — corriger le score",
+            "`/corriger @joueur points:` — corriger le score de la période actuelle",
+            "`/periode statut` / `config` — configurer la durée des périodes",
+            "`/essais statut` / `config` — configurer le nombre d’essais par joueur",
             "`/cloturer` — clôturer immédiatement la manche",
             "`/tableau` — créer ou actualiser le scoreboard permanent",
             "`/reinitialiser` — remettre entièrement le jeu à zéro",
         ]
+    text += ["", f"*Guess the Pix • v{BOT_VERSION.split('-', 1)[0]}*"]
     return "\n".join(text)
 
 
-async def build_leaderboard_embed(guild_id: int) -> discord.Embed:
-    rows = await db.leaderboard(guild_id)
-    if not rows:
-        return discord.Embed(
-            title="🏆 Scoreboard",
-            description="Le classement est encore vide.",
-        )
+async def build_leaderboard_embed(
+    guild_id: int,
+    period_number: int | None = None,
+    global_scores: bool = False,
+) -> discord.Embed:
+    period = None
+    if not global_scores:
+        if period_number is None:
+            period = await db.get_current_period(guild_id)
+        else:
+            period = await db.get_period_by_number(guild_id, period_number)
+            if period is None:
+                return discord.Embed(
+                    title=f"🏆 Classement — Période {period_number}",
+                    description="Cette période n’existe pas.",
+                )
+        rows = await db.leaderboard(guild_id, period_id=period["id"])
+        title = f"🏆 Classement — Période {period['number']}"
+    else:
+        rows = await db.leaderboard(guild_id)
+        title = "🏆 Classement global"
 
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, row in enumerate(rows):
-        prefix = medals[i] if i < 3 else f"**{i + 1}.**"
-        lines.append(
-            f"{prefix} <@{row['user_id']}> — **{row['score']} pt{'s' if row['score'] != 1 else ''}**"
-        )
-    return discord.Embed(title="🏆 Scoreboard", description="\n".join(lines))
+    if not rows:
+        embed = discord.Embed(title=title, description="Le classement est encore vide.")
+    else:
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, row in enumerate(rows):
+            prefix = medals[i] if i < 3 else f"**{i + 1}.**"
+            lines.append(
+                f"{prefix} <@{row['user_id']}> — **{row['score']} pt{'s' if row['score'] != 1 else ''}**"
+            )
+        embed = discord.Embed(title=title, description="\n".join(lines))
+
+    if period is not None:
+        progress, limit = await db.period_progress(period["id"])
+        if limit:
+            embed.set_footer(text=f"Période {period['number']} • {progress}/{limit} manches")
+        elif period["status"] == "active":
+            embed.set_footer(text=f"Période {period['number']} • durée illimitée")
+    return embed
 
 
 class RoundActionsView(discord.ui.View):
@@ -295,6 +356,17 @@ class RoundActionsView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        if await db.user_has_correct_attempt(round_row["id"], interaction.user.id):
+            await interaction.response.send_message("Tu as déjà trouvé le jeu pour cette manche.", ephemeral=True)
+            return
+        if round_row["attempt_limit"] is not None:
+            used = await db.user_attempt_count(round_row["id"], interaction.user.id)
+            if used >= int(round_row["attempt_limit"]):
+                await interaction.response.send_message(
+                    f"Tu as déjà utilisé tes **{round_row['attempt_limit']} essais** pour cette manche.",
+                    ephemeral=True,
+                )
+                return
 
         answer_command = self.bot.command_mention("reponse")
         await interaction.response.send_message(
@@ -323,7 +395,7 @@ class RoundActionsView(discord.ui.View):
     async def help(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check_context(interaction):
             return
-        await interaction.response.send_message(build_help_text(interaction), ephemeral=True)
+        await interaction.response.send_message(await build_help_text(interaction), ephemeral=True)
 
 
 class ValidationView(discord.ui.View):
@@ -457,10 +529,14 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
         hint_1_at = now + timedelta(days=2)
         hint_2_at = now + timedelta(days=4)
         hint_3_at = now + timedelta(days=6)
+        period = await db.get_current_period(interaction.guild_id)
+        attempt_limit = state["default_attempt_limit"]
         round_id = await db.create_round(
             guild_id=interaction.guild_id,
             channel_id=interaction.channel_id,
             master_id=interaction.user.id,
+            period_id=period["id"],
+            attempt_limit=attempt_limit,
             solution=str(self.solution).strip(),
             image_url=None,
             hint_1=str(self.hint_1).strip(),
@@ -479,7 +555,8 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
                 f"Proposée par {interaction.user.mention}\n"
                 f"**Pour participer :** utilisez les boutons ci-dessous, ou **`/participer`** puis **`/reponse`**.\n"
                 f"💡 Trois indices sont prévus à **J+2, J+4 et J+6**.\n"
-                f"⚡ Dès la première bonne réponse validée, il restera **24 h maximum** et les indices encore cachés seront rapprochés.\n\n"
+                f"⚡ Dès la première bonne réponse validée, il restera **24 h maximum** et les indices encore cachés seront rapprochés.\n"
+                f"🎯 Essais : **{'illimités' if attempt_limit is None else str(attempt_limit) + ' par joueur'}**.\n\n"
                 f"Fin maximale : <t:{int(ends.timestamp())}:F> — <t:{int(ends.timestamp())}:R>"
             ),
         )
@@ -613,7 +690,8 @@ class ScoreBot(commands.Bot):
 
     async def build_scoreboard_embed(self, guild_id: int) -> discord.Embed:
         state = await db.get_state(guild_id)
-        rows = await db.leaderboard(guild_id, limit=20)
+        period = await db.get_current_period(guild_id)
+        rows = await db.leaderboard(guild_id, limit=20, period_id=period["id"])
 
         if rows:
             medals = ["🥇", "🥈", "🥉"]
@@ -627,7 +705,7 @@ class ScoreBot(commands.Bot):
             score_lines = ["Aucun point attribué pour le moment."]
 
         embed = discord.Embed(
-            title="🏆 Scoreboard — Devine le jeu",
+            title=f"🏆 Scoreboard — Période {period['number']}",
             description="\n".join(score_lines),
         )
 
@@ -678,6 +756,9 @@ class ScoreBot(commands.Bot):
         registered_count = await db.active_participant_count(guild_id)
         embed.add_field(name="État du jeu", value=round_text, inline=False)
         embed.add_field(name="Participants inscrits", value=f"**{registered_count}**", inline=True)
+        progress, limit = await db.period_progress(period["id"])
+        period_status = f"{progress}/{limit} manches" if limit else "durée illimitée"
+        embed.add_field(name="Période", value=f"**{period['number']}** — {period_status}", inline=True)
         embed.set_footer(text=f"Mise à jour automatique • bot {BOT_VERSION}")
         return embed
 
@@ -719,6 +800,112 @@ class ScoreBot(commands.Bot):
             return None
         await db.set_scoreboard_message(guild_id, channel.id, message.id)
         return message
+
+    async def notify_new_leader(self, guild_id: int, user_id: int) -> bool:
+        user = self.get_user(user_id)
+        if user is None:
+            try:
+                user = await self.fetch_user(user_id)
+            except discord.HTTPException:
+                return False
+
+        channel_label = "le salon du jeu"
+        if config.game_channel_id:
+            channel = self.get_channel(config.game_channel_id)
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(config.game_channel_id)
+                except discord.HTTPException:
+                    channel = None
+            if isinstance(channel, discord.TextChannel):
+                channel_label = f"#{channel.name}"
+
+        try:
+            await user.send(
+                "🎮 **Tu es le prochain meneur !**\n\n"
+                f"Dans **{channel_label}**, tu peux utiliser :\n"
+                "**`/lancer`** — lancer la prochaine manche avec une image ou une URL, le nom du jeu et les 3 indices.\n"
+                "**`/passe`** — passer la main si tu ne souhaites pas proposer de manche.\n\n"
+                "Une manche dure au maximum 7 jours et passe en mode accéléré pendant 24 h après la première bonne réponse validée."
+            )
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
+    async def send_player_message(self, user_id: int, message: str) -> bool:
+        user = self.get_user(user_id)
+        if user is None:
+            try:
+                user = await self.fetch_user(user_id)
+            except discord.HTTPException:
+                return False
+        try:
+            await user.send(message)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
+    async def finalize_confirmable_results(self, round_id: int) -> set[int]:
+        """Attribue et notifie uniquement les positions devenues certaines."""
+        round_row = await db.get_round(round_id)
+        if not round_row:
+            return set()
+
+        finalized_users: set[int] = set()
+        candidates = list(await db.first_correct_attempts(round_id))
+        hints_enabled = round_has_hints(round_row)
+        for rank, attempt in enumerate(candidates, start=1):
+            if attempt["result_notified_at"]:
+                continue
+            # Une réponse encore en attente, envoyée plus tôt, pourrait modifier le rang.
+            if await db.pending_before(round_id, attempt["submitted_at"]):
+                continue
+
+            points = 0
+            if rank <= 3:
+                stage = hint_stage_for_submission(round_row, attempt["submitted_at"]) if hints_enabled else 3
+                points = podium_points(rank - 1, stage)
+
+            changed = await db.finalize_correct_result(
+                attempt_id=attempt["id"],
+                guild_id=round_row["guild_id"],
+                user_id=attempt["user_id"],
+                round_id=round_id,
+                period_id=round_row["period_id"],
+                rank=rank,
+                points=points,
+            )
+            if not changed:
+                continue
+
+            finalized_users.add(int(attempt["user_id"]))
+            if rank == 1:
+                position = "premier"
+            elif rank == 2:
+                position = "deuxième"
+            elif rank == 3:
+                position = "troisième"
+            else:
+                position = None
+
+            if position:
+                await self.send_player_message(
+                    attempt["user_id"],
+                    "✅ **Bonne réponse !**\n"
+                    f"Bravo, tu as trouvé et tu es **{position}**.\n"
+                    f"Tu marques **{points} point{'s' if points != 1 else ''}**.",
+                )
+            else:
+                await self.send_player_message(
+                    attempt["user_id"],
+                    "✅ **Bonne réponse !**\n"
+                    "Bravo, tu as trouvé, mais le podium est déjà complet.\n"
+                    "Tu ne marques pas de point pour cette manche.",
+                )
+
+        if finalized_users:
+            await self.update_scoreboard(round_row["guild_id"])
+        return finalized_users
 
     async def notify_leader(
         self,
@@ -789,8 +976,8 @@ class ScoreBot(commands.Bot):
         verdict = "validée" if status == "correct" else "invalidée"
         await interaction.response.send_message(f"Réponse {verdict}.", ephemeral=True)
 
-        # Le verdict n’est visible que du meneur. On fige le message privé afin
-        # d’éviter une seconde validation accidentelle et de garder un historique clair.
+        # On fige le message privé du meneur afin d’éviter une seconde validation
+        # accidentelle et de garder un historique clair.
         if interaction.message is not None:
             try:
                 embed = interaction.message.embeds[0].copy() if interaction.message.embeds else discord.Embed(
@@ -813,14 +1000,50 @@ class ScoreBot(commands.Bot):
                     datetime.fromisoformat(reviewed_attempt["reviewed_at"]),
                 )
 
-        try:
-            player = await self.fetch_user(attempt["user_id"])
-            await player.send(
-                f"Ta réponse à la manche #{attempt['round_id']} a été examinée. "
-                "Le résultat restera secret jusqu’à la clôture."
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+            finalized = await self.finalize_confirmable_results(attempt["round_id"])
+            if int(attempt["user_id"]) not in finalized:
+                await self.send_player_message(
+                    attempt["user_id"],
+                    "✅ **Bonne réponse !**\n"
+                    "Bravo, tu as trouvé.\n"
+                    "Ta position et tes points seront confirmés dès que les réponses précédentes auront été arbitrées.",
+                )
+        else:
+            used = await db.user_attempt_count(attempt["round_id"], attempt["user_id"])
+            limit = attempt["attempt_limit"]
+            if limit is None:
+                if attempt["round_status"] == "review":
+                    message = (
+                        "❌ **Mauvaise réponse.**\n"
+                        "La manche est désormais close aux nouvelles réponses."
+                    )
+                else:
+                    message = (
+                        "❌ **Mauvaise réponse.**\n"
+                        "Tu peux réessayer avec `/reponse`."
+                    )
+            else:
+                remaining_attempts = max(0, int(limit) - used)
+                if remaining_attempts > 0:
+                    if attempt["round_status"] == "review":
+                        message = (
+                            "❌ **Mauvaise réponse.**\n"
+                            f"Il te restait **{remaining_attempts} essai{'s' if remaining_attempts != 1 else ''}**, "
+                            "mais la manche est désormais close aux nouvelles réponses."
+                        )
+                    else:
+                        message = (
+                            "❌ **Mauvaise réponse.**\n"
+                            f"Il te reste **{remaining_attempts} essai{'s' if remaining_attempts != 1 else ''}** pour cette manche."
+                        )
+                else:
+                    message = (
+                        "❌ **Mauvaise réponse.**\n"
+                        "Tu as utilisé tous tes essais pour cette manche."
+                    )
+            await self.send_player_message(attempt["user_id"], message)
+            # Une invalidation peut lever l’incertitude sur le rang d’une bonne réponse plus tardive.
+            await self.finalize_confirmable_results(attempt["round_id"])
 
         refreshed = await db.get_attempt(int(raw_attempt_id))
         if refreshed and refreshed["round_status"] == "review":
@@ -980,33 +1203,37 @@ class ScoreBot(commands.Bot):
         if not round_row or round_row["status"] not in {"open", "review"}:
             return
 
-        # On ferme d’abord pour éviter une double attribution par deux déclenchements concurrents.
+        # À ce stade toutes les réponses sont arbitrées : tous les rangs deviennent certains.
+        await self.finalize_confirmable_results(round_id)
+
+        # On ferme ensuite pour éviter une double finalisation concurrente.
         if not await db.close_round(round_id):
             return
+        round_row = await db.get_round(round_id)
 
-        winners = list(await db.first_correct_by_user(round_id))
+        winners = list(await db.first_correct_attempts(round_id))
         podium = winners[:3]
-        awarded_points: list[int] = []
-        podium_stages: list[int] = []
+        awarded_points = [int(row["awarded_points"] or 0) for row in podium]
+        for rank, row in enumerate(podium, start=1):
+            points = int(row["awarded_points"] or 0)
+            if points:
+                await db.add_score(
+                    round_row["guild_id"],
+                    row["user_id"],
+                    points,
+                    f"podium_{rank}",
+                    round_id,
+                    period_id=round_row["period_id"],
+                )
         hints_enabled = round_has_hints(round_row)
-        for rank, row in enumerate(podium):
-            stage = hint_stage_for_submission(round_row, row["submitted_at"]) if hints_enabled else 3
-            points = podium_points(rank, stage)
-            awarded_points.append(points)
-            podium_stages.append(stage)
-            await db.add_score(
-                round_row["guild_id"],
-                row["user_id"],
-                points,
-                f"podium_{rank + 1}",
-                round_id,
-            )
+        podium_stages = [
+            hint_stage_for_submission(round_row, row["submitted_at"]) if hints_enabled else 3
+            for row in podium
+        ]
 
         next_master: int | None = None
         next_master_reason: str
         if podium:
-            # Le premier joueur encore inscrit devient meneur. Un joueur ayant quitté
-            # le jeu conserve ses points, mais n’est plus désignable comme meneur.
             for winner in winners:
                 if await db.is_participant_active(round_row["guild_id"], winner["user_id"]):
                     next_master = winner["user_id"]
@@ -1024,10 +1251,13 @@ class ScoreBot(commands.Bot):
                 await db.set_master(
                     round_row["guild_id"], next_master, previous_master_id=round_row["master_id"]
                 )
+                notified = await self.notify_new_leader(round_row["guild_id"], next_master)
                 if next_master == podium[0]["user_id"]:
                     next_master_reason = f"🎮 <@{next_master}> devient le **prochain meneur**."
                 else:
                     next_master_reason = f"🎮 <@{next_master}> devient le **prochain meneur** parmi les participants encore inscrits."
+                if not notified:
+                    next_master_reason += "\n⚠️ Impossible de lui envoyer les instructions en message privé."
             else:
                 await db.clear_master(
                     round_row["guild_id"], previous_master_id=round_row["master_id"]
@@ -1043,6 +1273,7 @@ class ScoreBot(commands.Bot):
                 4,
                 "unfound_master_bonus",
                 round_id,
+                period_id=round_row["period_id"],
             )
             guild = self.get_guild(round_row["guild_id"])
             next_master = (
@@ -1054,12 +1285,14 @@ class ScoreBot(commands.Bot):
                 await db.set_master(
                     round_row["guild_id"], next_master, previous_master_id=round_row["master_id"]
                 )
+                notified = await self.notify_new_leader(round_row["guild_id"], next_master)
                 next_master_reason = (
                     f"🎲 Personne n’ayant trouvé, <@{next_master}> est **tiré au sort** "
                     "comme prochain meneur."
                 )
+                if not notified:
+                    next_master_reason += "\n⚠️ Impossible de lui envoyer les instructions en message privé."
             else:
-                # Ne pas laisser le meneur sortant actif lorsqu’aucun tirage n’est possible.
                 await db.clear_master(
                     round_row["guild_id"], previous_master_id=round_row["master_id"]
                 )
@@ -1112,9 +1345,7 @@ class ScoreBot(commands.Bot):
         ]
         if round_row["accelerated_at"]:
             accelerated_dt = datetime.fromisoformat(round_row["accelerated_at"])
-            bilan_lines.append(
-                f"⚡ Mode accéléré déclenché <t:{int(accelerated_dt.timestamp())}:R>"
-            )
+            bilan_lines.append(f"⚡ Mode accéléré déclenché <t:{int(accelerated_dt.timestamp())}:R>")
         if other_correct:
             bilan_lines.append(
                 f"👏 **{other_correct}** autre{'s' if other_correct != 1 else ''} bonne{'s' if other_correct != 1 else ''} "
@@ -1136,6 +1367,33 @@ class ScoreBot(commands.Bot):
         if isinstance(channel, discord.abc.Messageable):
             await channel.send(embed=embed)
 
+        # Une période limitée se clôture une fois son nombre de manches atteint.
+        period = await db.get_current_period(round_row["guild_id"])
+        if period and int(period["id"]) == int(round_row["period_id"]):
+            progress, limit = await db.period_progress(period["id"])
+            if limit is not None and progress >= int(limit):
+                period_rows = await db.leaderboard(
+                    round_row["guild_id"], period_id=period["id"]
+                )
+                final_lines = []
+                medals = ["🥇", "🥈", "🥉"]
+                for i, row in enumerate(period_rows):
+                    prefix = medals[i] if i < 3 else f"**{i + 1}.**"
+                    final_lines.append(
+                        f"{prefix} <@{row['user_id']}> — **{row['score']} pt{'s' if row['score'] != 1 else ''}**"
+                    )
+                period_embed = discord.Embed(
+                    title=f"🏆 Fin de la Période {period['number']}",
+                    description="\n".join(final_lines) if final_lines else "Aucun point marqué pendant cette période.",
+                )
+                next_period = await db.close_period_and_create_next(
+                    round_row["guild_id"], period["id"]
+                )
+                if next_period:
+                    period_embed.set_footer(text=f"La Période {next_period['number']} commence maintenant.")
+                if isinstance(channel, discord.abc.Messageable):
+                    await channel.send(embed=period_embed)
+
         await self.update_scoreboard(round_row["guild_id"])
 
 
@@ -1148,7 +1406,7 @@ def game_channel_ok(interaction: discord.Interaction) -> bool:
 
 @bot.tree.command(name="aide", description="Afficher les commandes du jeu")
 async def help_command(interaction: discord.Interaction):
-    await interaction.response.send_message(build_help_text(interaction), ephemeral=True)
+    await interaction.response.send_message(await build_help_text(interaction), ephemeral=True)
 
 
 @bot.tree.command(name="designer", description="Désigner manuellement le prochain meneur")
@@ -1165,7 +1423,11 @@ async def designate(interaction: discord.Interaction, joueur: discord.Member):
         return
     state = await db.get_state(interaction.guild_id)
     await db.set_master(interaction.guild_id, joueur.id, previous_master_id=state["current_master_id"])
-    await interaction.response.send_message(f"🎮 {joueur.mention} est le prochain meneur.")
+    notified = await bot.notify_new_leader(interaction.guild_id, joueur.id)
+    message = f"🎮 {joueur.mention} est le prochain meneur."
+    if not notified:
+        message += "\n⚠️ Impossible de lui envoyer les instructions en message privé."
+    await interaction.response.send_message(message)
     await bot.update_scoreboard(interaction.guild_id)
 
 
@@ -1327,6 +1589,18 @@ async def answer(interaction: discord.Interaction, reponse: str):
     if interaction.user.id == round_row["master_id"]:
         await interaction.response.send_message("Le meneur ne peut pas répondre à sa propre manche.", ephemeral=True)
         return
+    if await db.user_has_correct_attempt(round_row["id"], interaction.user.id):
+        await interaction.response.send_message("Tu as déjà trouvé le jeu pour cette manche.", ephemeral=True)
+        return
+    attempt_limit = round_row["attempt_limit"]
+    if attempt_limit is not None:
+        used_attempts = await db.user_attempt_count(round_row["id"], interaction.user.id)
+        if used_attempts >= int(attempt_limit):
+            await interaction.response.send_message(
+                f"Tu as déjà utilisé tes **{attempt_limit} essais** pour cette manche.",
+                ephemeral=True,
+            )
+            return
 
     answer_text = reponse.strip()
     if not answer_text:
@@ -1340,7 +1614,7 @@ async def answer(interaction: discord.Interaction, reponse: str):
         interaction.guild_id, round_row["id"], interaction.user.id, answer_text
     )
     await interaction.response.send_message(
-        "Réponse enregistrée. Le meneur va l’examiner ; son verdict ne sera pas révélé avant la fin de la manche.",
+        "Réponse enregistrée. Le meneur va l’examiner et tu recevras son verdict en privé.",
         ephemeral=True,
     )
     await bot.notify_leader(round_row, attempt_id, interaction.user, answer_text)
@@ -1375,18 +1649,40 @@ async def pass_turn(interaction: discord.Interaction):
     await db.set_master(
         interaction.guild_id, new_master, previous_master_id=state["previous_master_id"]
     )
-    await interaction.response.send_message(f"🎲 Nouveau meneur tiré au sort : <@{new_master}>")
+    notified = await bot.notify_new_leader(interaction.guild_id, new_master)
+    message = f"🎲 Nouveau meneur tiré au sort : <@{new_master}>"
+    if not notified:
+        message += "\n⚠️ Impossible de lui envoyer les instructions en message privé."
+    await interaction.response.send_message(message)
     await bot.update_scoreboard(interaction.guild_id)
 
 
-@bot.tree.command(name="score", description="Afficher le classement général")
-async def score(interaction: discord.Interaction, joueur: discord.Member | None = None):
+@bot.tree.command(name="score", description="Afficher le classement d’une période")
+@app_commands.describe(
+    joueur="Joueur dont afficher les statistiques",
+    periode="Numéro de période à consulter (période actuelle par défaut)",
+)
+async def score(
+    interaction: discord.Interaction,
+    joueur: discord.Member | None = None,
+    periode: int | None = None,
+):
     if interaction.guild_id is None:
         await interaction.response.send_message("Commande disponible uniquement sur le serveur.", ephemeral=True)
         return
+
+    period = (
+        await db.get_current_period(interaction.guild_id)
+        if periode is None
+        else await db.get_period_by_number(interaction.guild_id, periode)
+    )
+    if period is None:
+        await interaction.response.send_message(f"La période {periode} n’existe pas.", ephemeral=True)
+        return
+
     if joueur:
-        stats = await db.user_stats(interaction.guild_id, joueur.id)
-        embed = discord.Embed(title=f"📊 Statistiques — {joueur.display_name}")
+        stats = await db.user_stats(interaction.guild_id, joueur.id, period_id=period["id"])
+        embed = discord.Embed(title=f"📊 Statistiques — {joueur.display_name} — Période {period['number']}")
         embed.add_field(name="Score", value=f"**{stats['score']}** point{'s' if stats['score'] != 1 else ''}", inline=True)
         embed.add_field(name="Classement", value=f"**#{stats['rank']}**" if stats['rank'] else "—", inline=True)
         embed.add_field(name="Manches jouées", value=str(stats['participations']), inline=True)
@@ -1398,8 +1694,137 @@ async def score(interaction: discord.Interaction, joueur: discord.Member | None 
         embed.add_field(name="Introuvables", value=str(stats['unfound']), inline=True)
         await interaction.response.send_message(embed=embed)
         return
-    embed = await build_leaderboard_embed(interaction.guild_id)
+
+    embed = await build_leaderboard_embed(interaction.guild_id, period_number=period["number"])
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="score-global", description="Afficher le classement toutes périodes confondues")
+async def global_score(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Commande disponible uniquement sur le serveur.", ephemeral=True)
+        return
+    embed = await build_leaderboard_embed(interaction.guild_id, global_scores=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="periodes", description="Afficher les périodes de classement")
+async def periods(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Commande disponible uniquement sur le serveur.", ephemeral=True)
+        return
+    rows = await db.list_periods(interaction.guild_id)
+    if not rows:
+        await interaction.response.send_message("Aucune période n’est disponible.")
+        return
+    lines: list[str] = []
+    for period in rows[:25]:
+        progress, limit = await db.period_progress(period["id"])
+        if period["status"] == "active":
+            suffix = f"en cours — {progress}/{limit} manches" if limit else "en cours — durée illimitée"
+        else:
+            suffix = "terminée"
+        lines.append(f"**Période {period['number']}** — {suffix}")
+    embed = discord.Embed(title="🗓️ Périodes de classement", description="\n".join(lines))
+    embed.set_footer(text="Utilisez /score periode:N pour consulter le classement d’une période.")
+    await interaction.response.send_message(embed=embed)
+
+
+period_group = app_commands.Group(name="periode", description="Configurer les périodes de classement")
+
+
+@period_group.command(name="statut", description="Afficher la configuration des périodes")
+async def period_status(interaction: discord.Interaction):
+    if interaction.guild_id is None or not is_admin(interaction):
+        await interaction.response.send_message("Commande réservée au rôle Admin du jeu ou aux administrateurs du serveur.", ephemeral=True)
+        return
+    period = await db.get_current_period(interaction.guild_id)
+    progress, limit = await db.period_progress(period["id"])
+    if limit is None:
+        text = f"**Période {period['number']}** — renouvellement automatique : **jamais**."
+    else:
+        text = f"**Période {period['number']}** — renouvellement toutes les **{limit} manches**. Progression : **{progress}/{limit}**."
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+@period_group.command(name="config", description="Configurer le renouvellement des périodes")
+@app_commands.describe(mode="Jamais ou après un nombre de manches", manches="Nombre de manches pour une période")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Jamais", value="jamais"),
+    app_commands.Choice(name="Nombre de manches", value="manches"),
+])
+async def period_config(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str],
+    manches: int | None = None,
+):
+    if interaction.guild_id is None or not is_admin(interaction):
+        await interaction.response.send_message("Commande réservée au rôle Admin du jeu ou aux administrateurs du serveur.", ephemeral=True)
+        return
+    if mode.value == "jamais":
+        await db.set_period_config(interaction.guild_id, None)
+        await interaction.response.send_message("Les périodes n’ont désormais **aucune limite de manches**.", ephemeral=True)
+    else:
+        if manches is None or manches < 1 or manches > 1000:
+            await interaction.response.send_message("Indique un nombre de manches compris entre 1 et 1000.", ephemeral=True)
+            return
+        await db.set_period_config(interaction.guild_id, manches)
+        await interaction.response.send_message(
+            f"La période actuelle se terminera après **{manches} nouvelles manches clôturées**. Les scores actuels sont conservés.",
+            ephemeral=True,
+        )
+    await bot.update_scoreboard(interaction.guild_id)
+
+
+bot.tree.add_command(period_group)
+
+
+attempt_group = app_commands.Group(name="essais", description="Configurer le nombre d’essais par joueur")
+
+
+@attempt_group.command(name="statut", description="Afficher la configuration des essais")
+async def attempts_status(interaction: discord.Interaction):
+    if interaction.guild_id is None or not is_admin(interaction):
+        await interaction.response.send_message("Commande réservée au rôle Admin du jeu ou aux administrateurs du serveur.", ephemeral=True)
+        return
+    state = await db.get_state(interaction.guild_id)
+    limit = state["default_attempt_limit"]
+    text = "Essais par joueur : **illimités**." if limit is None else f"Essais par joueur : **{limit}** par manche."
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+@attempt_group.command(name="config", description="Configurer le nombre d’essais par joueur")
+@app_commands.describe(mode="Essais illimités ou nombre limité", nombre="Nombre d’essais par joueur")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Illimité", value="illimite"),
+    app_commands.Choice(name="Nombre d’essais", value="nombre"),
+])
+async def attempts_config(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str],
+    nombre: int | None = None,
+):
+    if interaction.guild_id is None or not is_admin(interaction):
+        await interaction.response.send_message("Commande réservée au rôle Admin du jeu ou aux administrateurs du serveur.", ephemeral=True)
+        return
+    if mode.value == "illimite":
+        await db.set_attempt_config(interaction.guild_id, None)
+        await interaction.response.send_message(
+            "Le nombre d’essais est désormais **illimité** pour les prochaines manches.",
+            ephemeral=True,
+        )
+    else:
+        if nombre is None or nombre < 1 or nombre > 100:
+            await interaction.response.send_message("Indique un nombre d’essais compris entre 1 et 100.", ephemeral=True)
+            return
+        await db.set_attempt_config(interaction.guild_id, nombre)
+        await interaction.response.send_message(
+            f"Chaque joueur disposera de **{nombre} essais** à partir de la prochaine manche.",
+            ephemeral=True,
+        )
+
+
+bot.tree.add_command(attempt_group)
 
 
 @bot.tree.command(name="corriger", description="Ajouter ou retirer des points")
