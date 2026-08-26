@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.11.2-participants"
+BOT_VERSION = "0.11.3-round-message-ui"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -858,7 +858,7 @@ class ScoreBot(commands.Bot):
 
         if isinstance(channel, discord.abc.Messageable):
             embed = discord.Embed(
-                title=f"⚡ Le jeu s’accélère ! — Manche #{round_id}",
+                title=f"⚡ Manche #{round_id} - Le jeu s’accélère !",
                 description=(
                     "Une première bonne réponse a été validée. Son auteur reste secret jusqu’à la fin.\n\n"
                     f"Les autres participants ont désormais jusqu’à <t:{int(effective_end.timestamp())}:F> "
@@ -867,8 +867,10 @@ class ScoreBot(commands.Bot):
                 ),
                 timestamp=accelerated_at,
             )
+            if refreshed["image_url"]:
+                embed.set_image(url=refreshed["image_url"])
             try:
-                await channel.send(embed=embed)
+                await channel.send(embed=embed, view=RoundActionsView(self))
             except discord.HTTPException:
                 pass
 
@@ -905,13 +907,15 @@ class ScoreBot(commands.Bot):
 
                 remaining_points = {1: "5 / 4 / 3", 2: "4 / 3 / 2", 3: "3 / 2 / 1"}[hint_number]
                 embed = discord.Embed(
-                    title=f"💡 Indice {hint_number}/3 — Manche #{round_row['id']}",
+                    title=f"💡 Manche #{round_row['id']} - Indice {hint_number}/3",
                     description=round_row[f"hint_{hint_number}"],
                     timestamp=now,
                 )
                 embed.set_footer(text=f"Barème du podium à partir de maintenant : {remaining_points} points")
+                if round_row["image_url"]:
+                    embed.set_image(url=round_row["image_url"])
                 try:
-                    hint_message = await channel.send(embed=embed)
+                    hint_message = await channel.send(embed=embed, view=RoundActionsView(self))
                 except discord.HTTPException:
                     continue
 
