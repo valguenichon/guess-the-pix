@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.12.1-help-settings"
+BOT_VERSION = "0.13.0-scoring-images"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -66,9 +66,32 @@ def hint_stage_for_submission(round_row, submitted_at: str) -> int:
 
 
 def podium_points(rank: int, hint_stage: int) -> int:
-    """Barème : 6/5/4, 5/4/3, 4/3/2, puis 3/2/1."""
+    """Barème du podium : 6/5/4, 5/4/3, 4/3/2, puis 3/2/1."""
     base = (3, 2, 1)[rank]
     return base + max(0, 3 - hint_stage)
+
+
+def points_for_rank(rank: int, hint_stage: int) -> int:
+    """Points d'une bonne réponse : podium dynamique, puis 1 point à partir de la 4e place."""
+    if rank >= 4:
+        return 1
+    return podium_points(rank - 1, hint_stage)
+
+
+def french_rank(rank: int) -> str:
+    labels = {
+        1: "premier",
+        2: "deuxième",
+        3: "troisième",
+        4: "quatrième",
+        5: "cinquième",
+        6: "sixième",
+        7: "septième",
+        8: "huitième",
+        9: "neuvième",
+        10: "dixième",
+    }
+    return labels.get(rank, f"{rank}e")
 
 
 def hint_stage_label(stage: int) -> str:
@@ -200,11 +223,11 @@ async def build_help_text(interaction: discord.Interaction) -> str:
         "**Règles en bref**",
         "• **`/participer`** est requis pour répondre et être tiré au sort.",
         "• Manche : **7 jours max**, indices à **J+2/J+4/J+6** ; après la 1re bonne réponse validée, fin sous **24 h max**.",
-        "• Le nombre d’essais peut être **illimité** ou limité pour chaque manche.",
-        "• Après validation, le verdict est envoyé en privé.",
-        "• Podium : **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2**, et **3/2/1** après le 3e.",
+        "• Essais : **illimités ou limités** selon la manche.",
+        "• Verdict envoyé en privé après validation.",
+        "• Podium : **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2**, et **3/2/1** après le 3e ; **1 pt à partir de la 4e place**.",
         "• Si personne ne trouve : **+4 pts au meneur**.",
-        "• Le 1er devient meneur ; s’il passe, tirage parmi les participants inscrits.",
+        "• Le 1er devient meneur ; s’il passe, un participant est tiré au sort.",
         "• Classement par **périodes** ; `/score` affiche la période en cours.",
         "",
         "**Commandes du meneur**",
@@ -571,8 +594,9 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             message = await interaction.original_response()
         except discord.HTTPException:
             message = None
-        if message and message.attachments:
-            await db.update_round_image_url(round_id, message.attachments[0].url)
+        if message is not None:
+            image_url = message.attachments[0].url if message.attachments else None
+            await db.update_round_message_reference(round_id, message.id, image_url)
 
         await self.bot.update_scoreboard(interaction.guild_id)
 
@@ -687,6 +711,63 @@ class ScoreBot(commands.Bot):
             filename = f"{filename}{ext}"
 
         return discord.File(io.BytesIO(data), filename=filename)
+
+    async def resolve_round_image_url(self, round_row) -> str | None:
+        """Return a fresh Discord attachment URL for a round screenshot when possible.
+
+        Discord attachment URLs are signed and may expire. The initial round message is
+        therefore the source of truth. For rounds created before v0.13.0, the helper
+        can locate that message once from channel history and persist its message ID.
+        """
+        channel = self.get_channel(int(round_row["channel_id"]))
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(int(round_row["channel_id"]))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+
+        if channel is not None and hasattr(channel, "fetch_message"):
+            message_id = round_row["round_message_id"]
+            if message_id:
+                try:
+                    message = await channel.fetch_message(int(message_id))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    message = None
+                if message is not None and message.attachments:
+                    fresh_url = message.attachments[0].url
+                    if fresh_url != round_row["image_url"]:
+                        await db.update_round_message_reference(
+                            int(round_row["id"]), int(message.id), fresh_url
+                        )
+                    return fresh_url
+
+            # Migration path for a round already in progress during the v0.13.0 update.
+            if not message_id and hasattr(channel, "history"):
+                started_at = datetime.fromisoformat(round_row["started_at"])
+                after = started_at - timedelta(minutes=2)
+                before = started_at + timedelta(minutes=15)
+                expected_title = f"🎮 Manche #{round_row['id']}"
+                try:
+                    async for message in channel.history(
+                        limit=100, after=after, before=before, oldest_first=True
+                    ):
+                        if self.user is not None and message.author.id != self.user.id:
+                            continue
+                        if not message.attachments:
+                            continue
+                        if not any(embed.title == expected_title for embed in message.embeds):
+                            continue
+                        fresh_url = message.attachments[0].url
+                        await db.update_round_message_reference(
+                            int(round_row["id"]), int(message.id), fresh_url
+                        )
+                        return fresh_url
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+        # Last-resort compatibility fallback. It may still work when the signed URL
+        # has not expired yet, and avoids breaking old/deleted round messages.
+        return round_row["image_url"]
 
     async def build_scoreboard_embed(self, guild_id: int) -> discord.Embed:
         state = await db.get_state(guild_id)
@@ -861,10 +942,8 @@ class ScoreBot(commands.Bot):
             if await db.pending_before(round_id, attempt["submitted_at"]):
                 continue
 
-            points = 0
-            if rank <= 3:
-                stage = hint_stage_for_submission(round_row, attempt["submitted_at"]) if hints_enabled else 3
-                points = podium_points(rank - 1, stage)
+            stage = hint_stage_for_submission(round_row, attempt["submitted_at"]) if hints_enabled else 3
+            points = points_for_rank(rank, stage)
 
             changed = await db.finalize_correct_result(
                 attempt_id=attempt["id"],
@@ -879,29 +958,13 @@ class ScoreBot(commands.Bot):
                 continue
 
             finalized_users.add(int(attempt["user_id"]))
-            if rank == 1:
-                position = "premier"
-            elif rank == 2:
-                position = "deuxième"
-            elif rank == 3:
-                position = "troisième"
-            else:
-                position = None
-
-            if position:
-                await self.send_player_message(
-                    attempt["user_id"],
-                    "✅ **Bonne réponse !**\n"
-                    f"Bravo, tu as trouvé et tu es **{position}**.\n"
-                    f"Tu marques **{points} point{'s' if points != 1 else ''}**.",
-                )
-            else:
-                await self.send_player_message(
-                    attempt["user_id"],
-                    "✅ **Bonne réponse !**\n"
-                    "Bravo, tu as trouvé, mais le podium est déjà complet.\n"
-                    "Tu ne marques pas de point pour cette manche.",
-                )
+            position = french_rank(rank)
+            await self.send_player_message(
+                attempt["user_id"],
+                "✅ **Bonne réponse !**\n"
+                f"Bravo, tu as trouvé et tu es **{position}**.\n"
+                f"Tu marques **{points} point{'s' if points != 1 else ''}**.",
+            )
 
         if finalized_users:
             await self.update_scoreboard(round_row["guild_id"])
@@ -1090,8 +1153,9 @@ class ScoreBot(commands.Bot):
                 ),
                 timestamp=accelerated_at,
             )
-            if refreshed["image_url"]:
-                embed.set_image(url=refreshed["image_url"])
+            image_url = await self.resolve_round_image_url(refreshed)
+            if image_url:
+                embed.set_image(url=image_url)
             try:
                 await channel.send(embed=embed, view=RoundActionsView(self))
             except discord.HTTPException:
@@ -1134,9 +1198,12 @@ class ScoreBot(commands.Bot):
                     description=round_row[f"hint_{hint_number}"],
                     timestamp=now,
                 )
-                embed.set_footer(text=f"Barème du podium à partir de maintenant : {remaining_points} points")
-                if round_row["image_url"]:
-                    embed.set_image(url=round_row["image_url"])
+                embed.set_footer(
+                    text=f"Barème du podium à partir de maintenant : {remaining_points} points • 1 pt à partir de la 4e place"
+                )
+                image_url = await self.resolve_round_image_url(round_row)
+                if image_url:
+                    embed.set_image(url=image_url)
                 try:
                     hint_message = await channel.send(embed=embed, view=RoundActionsView(self))
                 except discord.HTTPException:
@@ -1212,24 +1279,33 @@ class ScoreBot(commands.Bot):
         round_row = await db.get_round(round_id)
 
         winners = list(await db.first_correct_attempts(round_id))
-        podium = winners[:3]
-        awarded_points = [int(row["awarded_points"] or 0) for row in podium]
-        for rank, row in enumerate(podium, start=1):
-            points = int(row["awarded_points"] or 0)
-            if points:
-                await db.add_score(
-                    round_row["guild_id"],
-                    row["user_id"],
-                    points,
-                    f"podium_{rank}",
-                    round_id,
-                    period_id=round_row["period_id"],
-                )
         hints_enabled = round_has_hints(round_row)
-        podium_stages = [
+        winner_stages = [
             hint_stage_for_submission(round_row, row["submitted_at"]) if hints_enabled else 3
-            for row in podium
+            for row in winners
         ]
+        winner_points = [
+            points_for_rank(rank, winner_stages[rank - 1])
+            for rank in range(1, len(winners) + 1)
+        ]
+
+        # Recalcule le barème à la clôture à partir des horodatages réels. Cela
+        # garantit notamment le +1 à partir de la 4e place, y compris si une
+        # manche était déjà en cours lors de la mise à jour vers v0.13.0.
+        for rank, (row, points) in enumerate(zip(winners, winner_points), start=1):
+            reason = f"podium_{rank}" if rank <= 3 else "correct_after_podium"
+            await db.add_score(
+                round_row["guild_id"],
+                row["user_id"],
+                points,
+                reason,
+                round_id,
+                period_id=round_row["period_id"],
+            )
+
+        podium = winners[:3]
+        awarded_points = winner_points[:3]
+        podium_stages = winner_stages[:3]
 
         next_master: int | None = None
         next_master_reason: str
@@ -1349,14 +1425,17 @@ class ScoreBot(commands.Bot):
         if other_correct:
             bilan_lines.append(
                 f"👏 **{other_correct}** autre{'s' if other_correct != 1 else ''} bonne{'s' if other_correct != 1 else ''} "
-                f"réponse{'s' if other_correct != 1 else ''} au-delà du podium"
+                f"réponse{'s' if other_correct != 1 else ''} au-delà du podium — **+1 pt chacun**"
             )
         embed.add_field(name="Bilan de la manche", value="\n".join(bilan_lines), inline=False)
         embed.add_field(name="Prochaine manche", value=next_master_reason, inline=False)
 
-        if round_row["image_url"]:
-            embed.set_image(url=round_row["image_url"])
-        embed.set_footer(text="Les points dépendent du rang et du nombre d’indices déjà révélés au moment de la bonne réponse.")
+        image_url = await self.resolve_round_image_url(round_row)
+        if image_url:
+            embed.set_image(url=image_url)
+        embed.set_footer(
+            text="Le podium dépend du rang et des indices révélés ; à partir de la 4e place, toute bonne réponse rapporte 1 point."
+        )
 
         channel = self.get_channel(round_row["channel_id"])
         if channel is None:

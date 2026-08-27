@@ -70,6 +70,7 @@ class Database:
                     attempt_limit INTEGER,
                     solution TEXT NOT NULL,
                     image_url TEXT,
+                    round_message_id INTEGER,
                     hint_1 TEXT,
                     hint_2 TEXT,
                     hint_3 TEXT,
@@ -151,6 +152,7 @@ class Database:
                 ("original_ends_at", "TEXT"),
                 ("period_id", "INTEGER"),
                 ("attempt_limit", "INTEGER"),
+                ("round_message_id", "INTEGER"),
             ):
                 if column not in round_columns:
                     await db.execute(f"ALTER TABLE rounds ADD COLUMN {column} {definition}")
@@ -595,6 +597,19 @@ class Database:
             await db.execute(
                 "UPDATE rounds SET image_url = ? WHERE id = ?",
                 (image_url, round_id),
+            )
+            await db.commit()
+
+    async def update_round_message_reference(
+        self,
+        round_id: int,
+        message_id: int,
+        image_url: str | None = None,
+    ) -> None:
+        async with self.connection() as db:
+            await db.execute(
+                "UPDATE rounds SET round_message_id = ?, image_url = COALESCE(?, image_url) WHERE id = ?",
+                (message_id, image_url, round_id),
             )
             await db.commit()
 
