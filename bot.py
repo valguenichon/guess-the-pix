@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.13.1-image-reupload"
+BOT_VERSION = "0.13.2-interaction-timeouts"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -465,10 +465,14 @@ class ResetConfirmView(discord.ui.View):
             )
             return
 
+        # Le reset peut effectuer plusieurs opérations SQLite et une mise à jour du
+        # scoreboard. On acquitte donc immédiatement le clic pour ne pas laisser
+        # expirer l'interaction Discord.
+        await interaction.response.defer()
         await db.reset_guild(interaction.guild_id)
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=(
                 "✅ **Jeu entièrement réinitialisé.**\n"
                 "Scores, historique, manches, tentatives et meneur ont été effacés. "
@@ -541,10 +545,14 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             await interaction.response.send_message("Seul le meneur désigné peut lancer la manche.", ephemeral=True)
             return
 
+        # La lecture d'une pièce jointe et surtout le téléchargement d'une URL
+        # peuvent dépasser la fenêtre de réponse de Discord. Le modal est donc
+        # acquitté avant toute opération réseau potentiellement lente.
+        await interaction.response.defer(thinking=True)
         try:
             upload_file = await self.bot.prepare_round_image(self.capture, self.image_url)
         except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await interaction.followup.send(str(exc), ephemeral=True)
             return
 
         now = datetime.now(timezone.utc)
@@ -584,16 +592,13 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             ),
         )
         embed.set_image(url=f"attachment://{upload_file.filename}")
-        await interaction.response.send_message(
+        message = await interaction.followup.send(
             embed=embed,
             file=upload_file,
             view=RoundActionsView(self.bot),
+            wait=True,
         )
 
-        try:
-            message = await interaction.original_response()
-        except discord.HTTPException:
-            message = None
         if message is not None:
             image_url = message.attachments[0].url if message.attachments else None
             await db.update_round_message_reference(round_id, message.id, image_url)
@@ -1556,12 +1561,15 @@ async def designate(interaction: discord.Interaction, joueur: discord.Member):
         await interaction.response.send_message("Ce membre n’est pas inscrit au jeu. Il doit d’abord utiliser `/participer`.", ephemeral=True)
         return
     state = await db.get_state(interaction.guild_id)
+    # Le DM au nouveau meneur peut nécessiter des appels API Discord. On acquitte
+    # la commande avant ces opérations pour éviter un timeout côté utilisateur.
+    await interaction.response.defer()
     await db.set_master(interaction.guild_id, joueur.id, previous_master_id=state["current_master_id"])
     notified = await bot.notify_new_leader(interaction.guild_id, joueur.id)
     message = f"🎮 {joueur.mention} est le prochain meneur."
     if not notified:
         message += "\n⚠️ Impossible de lui envoyer les instructions en message privé."
-    await interaction.response.send_message(message)
+    await interaction.followup.send(message)
     await bot.update_scoreboard(interaction.guild_id)
 
 
@@ -1773,21 +1781,41 @@ async def pass_turn(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Serveur Discord introuvable.", ephemeral=True)
         return
+
+    # Le tirage peut déclencher fetch_member(). On acquitte l'interaction avant
+    # le premier appel réseau potentiellement lent.
+    await interaction.response.defer()
     new_master = await random_registered_participant(interaction.guild, excluded)
     if not new_master:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Aucun autre participant inscrit n’est éligible au tirage.",
             ephemeral=True,
         )
         return
-    await db.set_master(
-        interaction.guild_id, new_master, previous_master_id=state["previous_master_id"]
+
+    # Protection contre deux /passe reçus presque simultanément : seul le premier
+    # peut remplacer le meneur qui a lancé la commande.
+    changed = await db.compare_and_set_master(
+        interaction.guild_id,
+        expected_master_id=interaction.user.id,
+        user_id=new_master,
+        previous_master_id=state["previous_master_id"],
     )
+    if not changed:
+        await interaction.followup.send(
+            "La main a déjà été passée ou le meneur a changé entre-temps.",
+            ephemeral=True,
+        )
+        return
+
     notified = await bot.notify_new_leader(interaction.guild_id, new_master)
-    message = f"🎲 Nouveau meneur tiré au sort : <@{new_master}>"
+    message = (
+        "🎮 **Nouveau meneur**\n"
+        f"<@{new_master}> a été tiré au sort pour proposer la prochaine manche."
+    )
     if not notified:
         message += "\n⚠️ Impossible de lui envoyer les instructions en message privé."
-    await interaction.response.send_message(message)
+    await interaction.followup.send(message)
     await bot.update_scoreboard(interaction.guild_id)
 
 
@@ -1847,13 +1875,21 @@ async def periods(interaction: discord.Interaction):
     if interaction.guild_id is None:
         await interaction.response.send_message("Commande disponible uniquement sur le serveur.", ephemeral=True)
         return
-    rows = await db.list_periods(interaction.guild_id)
+    await interaction.response.defer()
+    # Une seule requête agrégée remplace l'ancien schéma N+1
+    # (une requête supplémentaire par période).
+    rows = await db.list_periods_with_progress(interaction.guild_id)
     if not rows:
-        await interaction.response.send_message("Aucune période n’est disponible.")
+        await interaction.followup.send("Aucune période n’est disponible.")
         return
     lines: list[str] = []
     for period in rows[:25]:
-        progress, limit = await db.period_progress(period["id"])
+        progress = max(
+            0,
+            int(period["closed_round_count"] or 0)
+            - int(period["round_count_offset"] or 0),
+        )
+        limit = period["round_limit"]
         if period["status"] == "active":
             suffix = f"en cours — {progress}/{limit} manches" if limit else "en cours — durée illimitée"
         else:
@@ -1861,7 +1897,7 @@ async def periods(interaction: discord.Interaction):
         lines.append(f"**Période {period['number']}** — {suffix}")
     embed = discord.Embed(title="🗓️ Périodes de classement", description="\n".join(lines))
     embed.set_footer(text="Utilisez /score periode:N pour consulter le classement d’une période.")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 period_group = app_commands.Group(name="periode", description="Configurer les périodes de classement")

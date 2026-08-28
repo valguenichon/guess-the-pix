@@ -274,6 +274,31 @@ class Database:
             )
             await db.commit()
 
+    async def compare_and_set_master(
+        self,
+        guild_id: int,
+        expected_master_id: int,
+        user_id: int,
+        previous_master_id: int | None = None,
+    ) -> bool:
+        """Remplace le meneur seulement s'il n'a pas changé entre-temps.
+
+        Cette opération atomique empêche deux commandes /passe concurrentes de
+        sélectionner successivement deux meneurs différents.
+        """
+        await self.ensure_guild(guild_id)
+        async with self.connection() as db:
+            cursor = await db.execute(
+                """
+                UPDATE guild_state
+                SET previous_master_id = ?, current_master_id = ?
+                WHERE guild_id = ? AND current_master_id = ?
+                """,
+                (previous_master_id, user_id, guild_id, expected_master_id),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
     async def clear_master(self, guild_id: int, previous_master_id: int | None = None) -> None:
         await self.ensure_guild(guild_id)
         async with self.connection() as db:
@@ -403,6 +428,22 @@ class Database:
         async with self.connection() as db:
             return await (await db.execute(
                 "SELECT * FROM periods WHERE guild_id = ? ORDER BY number DESC",
+                (guild_id,),
+            )).fetchall()
+
+    async def list_periods_with_progress(self, guild_id: int):
+        """Liste les périodes et leur nombre de manches clôturées en une requête."""
+        async with self.connection() as db:
+            return await (await db.execute(
+                """
+                SELECT p.*, COUNT(r.id) AS closed_round_count
+                FROM periods p
+                LEFT JOIN rounds r
+                  ON r.period_id = p.id AND r.status = 'closed'
+                WHERE p.guild_id = ?
+                GROUP BY p.id
+                ORDER BY p.number DESC
+                """,
                 (guild_id,),
             )).fetchall()
 

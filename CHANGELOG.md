@@ -1,3 +1,28 @@
+# Changelog — v0.13.2
+
+## Fixed
+
+- Hardened Discord interaction handling to prevent "The application did not respond" errors when commands perform slower API or database work.
+- `/passe` now acknowledges the interaction before participant lookup, leader reassignment, DM delivery, and scoreboard refresh.
+- Added an atomic leader handoff for `/passe` so two near-simultaneous requests cannot select two different leaders.
+- `/designer` now acknowledges the command before sending the new leader's private instructions.
+- The `/lancer` modal now acknowledges submission before reading or downloading the round image, including external URLs that may take several seconds to respond.
+- `/periodes` now acknowledges immediately and retrieves period progress in a single aggregated query instead of one query per period.
+- The destructive `/reinitialiser` confirmation button now acknowledges the click before performing the database reset.
+
+## Changed
+
+- `/passe` now publishes a clear public **New leader** message naming the randomly selected participant.
+- The selected leader still receives the usual private `/lancer` and `/passe` instructions.
+
+## Compatibility
+
+- No database schema migration is required when upgrading from v0.13.1.
+- No `.env` changes are required.
+- Replace both `bot.py` and `database.py`, then restart the container.
+
+---
+
 # Changelog — v0.13.1
 
 ## Fixed
