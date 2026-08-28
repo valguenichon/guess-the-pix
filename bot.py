@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.13.0-scoring-images"
+BOT_VERSION = "0.13.1-image-reupload"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -712,12 +712,14 @@ class ScoreBot(commands.Bot):
 
         return discord.File(io.BytesIO(data), filename=filename)
 
-    async def resolve_round_image_url(self, round_row) -> str | None:
-        """Return a fresh Discord attachment URL for a round screenshot when possible.
+    async def prepare_round_repost_image(self, round_row) -> discord.File | None:
+        """Build a fresh Discord upload for a round screenshot.
 
-        Discord attachment URLs are signed and may expire. The initial round message is
-        therefore the source of truth. For rounds created before v0.13.0, the helper
-        can locate that message once from channel history and persist its message ID.
+        Delayed messages must not depend on an attachment CDN URL: Discord attachment
+        URLs are signed and can expire. We therefore fetch the original round message,
+        download its attachment bytes, and upload those bytes again with the new
+        hint/acceleration/result message. Rounds created before v0.13.0 can still have
+        their original message located from channel history.
         """
         channel = self.get_channel(int(round_row["channel_id"]))
         if channel is None:
@@ -726,23 +728,20 @@ class ScoreBot(commands.Bot):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 channel = None
 
+        attachment = None
+        source_message = None
+
         if channel is not None and hasattr(channel, "fetch_message"):
             message_id = round_row["round_message_id"]
             if message_id:
                 try:
-                    message = await channel.fetch_message(int(message_id))
+                    source_message = await channel.fetch_message(int(message_id))
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    message = None
-                if message is not None and message.attachments:
-                    fresh_url = message.attachments[0].url
-                    if fresh_url != round_row["image_url"]:
-                        await db.update_round_message_reference(
-                            int(round_row["id"]), int(message.id), fresh_url
-                        )
-                    return fresh_url
+                    source_message = None
 
-            # Migration path for a round already in progress during the v0.13.0 update.
-            if not message_id and hasattr(channel, "history"):
+            # Migration path for a round already in progress when round_message_id
+            # was introduced. Find the original launch message once and persist it.
+            if source_message is None and hasattr(channel, "history"):
                 started_at = datetime.fromisoformat(round_row["started_at"])
                 after = started_at - timedelta(minutes=2)
                 before = started_at + timedelta(minutes=15)
@@ -757,17 +756,69 @@ class ScoreBot(commands.Bot):
                             continue
                         if not any(embed.title == expected_title for embed in message.embeds):
                             continue
-                        fresh_url = message.attachments[0].url
+                        source_message = message
                         await db.update_round_message_reference(
-                            int(round_row["id"]), int(message.id), fresh_url
+                            int(round_row["id"]),
+                            int(message.id),
+                            message.attachments[0].url,
                         )
-                        return fresh_url
+                        break
                 except (discord.Forbidden, discord.HTTPException):
-                    pass
+                    source_message = None
 
-        # Last-resort compatibility fallback. It may still work when the signed URL
-        # has not expired yet, and avoids breaking old/deleted round messages.
-        return round_row["image_url"]
+        if source_message is not None and source_message.attachments:
+            attachment = source_message.attachments[0]
+            await db.update_round_message_reference(
+                int(round_row["id"]), int(source_message.id), attachment.url
+            )
+            try:
+                # Fetching the message first gives us a current signed attachment URL.
+                data = await attachment.read()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                try:
+                    # Discord's media proxy can sometimes outlive the direct CDN URL.
+                    data = await attachment.read(use_cached=True)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    data = b""
+
+            if data:
+                filename = (attachment.filename or "capture").strip()
+                filename = filename.replace(chr(92), "_").replace("/", "_") or "capture"
+                if "." not in filename:
+                    content_type = attachment.content_type or ""
+                    ext = mimetypes.guess_extension(content_type) or ".png"
+                    filename = f"{filename}{ext}"
+                return discord.File(io.BytesIO(data), filename=filename)
+
+        # Compatibility fallback for a deleted/unavailable original message. This is
+        # intentionally only a last resort because the stored URL may already be stale.
+        fallback_url = round_row["image_url"]
+        if fallback_url:
+            timeout = aiohttp.ClientTimeout(total=20)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(str(fallback_url), allow_redirects=True) as response:
+                        if response.status == 200:
+                            data = await response.read()
+                            if data:
+                                content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+                                ext = mimetypes.guess_extension(content_type) or ".png"
+                                return discord.File(io.BytesIO(data), filename=f"capture{ext}")
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                pass
+
+        logger.warning(
+            "Impossible de recuperer la capture de la manche %s pour reupload",
+            round_row["id"],
+        )
+        return None
+
+    async def attach_round_image(self, embed: discord.Embed, round_row) -> discord.File | None:
+        """Attach a fresh copy of the round screenshot to a new Discord message."""
+        image_file = await self.prepare_round_repost_image(round_row)
+        if image_file is not None:
+            embed.set_image(url=f"attachment://{image_file.filename}")
+        return image_file
 
     async def build_scoreboard_embed(self, guild_id: int) -> discord.Embed:
         state = await db.get_state(guild_id)
@@ -842,6 +893,7 @@ class ScoreBot(commands.Bot):
         embed.add_field(name="Période", value=f"**{period['number']}** — {period_status}", inline=True)
         embed.set_footer(text=f"Mise à jour automatique • bot {BOT_VERSION}")
         return embed
+
 
     async def update_scoreboard(self, guild_id: int, create_if_missing: bool = False) -> discord.Message | None:
         state = await db.get_state(guild_id)
@@ -1153,11 +1205,12 @@ class ScoreBot(commands.Bot):
                 ),
                 timestamp=accelerated_at,
             )
-            image_url = await self.resolve_round_image_url(refreshed)
-            if image_url:
-                embed.set_image(url=image_url)
+            image_file = await self.attach_round_image(embed, refreshed)
+            send_kwargs = {"embed": embed, "view": RoundActionsView(self)}
+            if image_file is not None:
+                send_kwargs["file"] = image_file
             try:
-                await channel.send(embed=embed, view=RoundActionsView(self))
+                await channel.send(**send_kwargs)
             except discord.HTTPException:
                 pass
 
@@ -1201,11 +1254,12 @@ class ScoreBot(commands.Bot):
                 embed.set_footer(
                     text=f"Barème du podium à partir de maintenant : {remaining_points} points • 1 pt à partir de la 4e place"
                 )
-                image_url = await self.resolve_round_image_url(round_row)
-                if image_url:
-                    embed.set_image(url=image_url)
+                image_file = await self.attach_round_image(embed, round_row)
+                send_kwargs = {"embed": embed, "view": RoundActionsView(self)}
+                if image_file is not None:
+                    send_kwargs["file"] = image_file
                 try:
-                    hint_message = await channel.send(embed=embed, view=RoundActionsView(self))
+                    hint_message = await channel.send(**send_kwargs)
                 except discord.HTTPException:
                     continue
 
@@ -1430,9 +1484,7 @@ class ScoreBot(commands.Bot):
         embed.add_field(name="Bilan de la manche", value="\n".join(bilan_lines), inline=False)
         embed.add_field(name="Prochaine manche", value=next_master_reason, inline=False)
 
-        image_url = await self.resolve_round_image_url(round_row)
-        if image_url:
-            embed.set_image(url=image_url)
+        image_file = await self.attach_round_image(embed, round_row)
         embed.set_footer(
             text="Le podium dépend du rang et des indices révélés ; à partir de la 4e place, toute bonne réponse rapporte 1 point."
         )
@@ -1444,7 +1496,10 @@ class ScoreBot(commands.Bot):
             except discord.HTTPException:
                 channel = None
         if isinstance(channel, discord.abc.Messageable):
-            await channel.send(embed=embed)
+            send_kwargs = {"embed": embed}
+            if image_file is not None:
+                send_kwargs["file"] = image_file
+            await channel.send(**send_kwargs)
 
         # Une période limitée se clôture une fois son nombre de manches atteint.
         period = await db.get_current_period(round_row["guild_id"])
