@@ -11,74 +11,56 @@ Bot Discord mono-serveur pour un jeu de découverte de jeux vidéo à partir de 
 - La première bonne réponse validée déclenche le mode accéléré : 24 h maximum restantes, sans dépasser la fin initiale.
 - Les réponses sont privées et arbitrées par le meneur.
 - Le verdict est communiqué immédiatement au joueur après validation.
-- Le scoring du podium reste 6/5/4, puis 5/4/3, 4/3/2 et 3/2/1 selon les indices révélés.
+- Le podium rapporte 6/5/4, puis 5/4/3, 4/3/2 et 3/2/1 selon les indices révélés.
+- **À partir de la 4e place, toute bonne réponse rapporte 1 point.**
 - Si personne ne trouve, le meneur gagne 4 points.
+- Le classement est organisé par périodes et le nombre d’essais peut être illimité ou limité par l’administration.
 
-## Nouveautés v0.12.1
+## Nouveautés v0.13.x
 
-### Périodes de classement
+### 1 point à partir de la 4e place
 
-Le classement est maintenant organisé par périodes. Par défaut, la période ne se termine jamais automatiquement.
+Le podium conserve son barème progressif en fonction des indices. Tous les joueurs classés à partir de la 4e position reçoivent 1 point lorsqu’ils trouvent le jeu.
 
-Commandes publiques :
 
-- `/score` — période actuelle
-- `/score periode:N` — période choisie
-- `/score joueur:@membre periode:N` — statistiques d’un joueur sur une période
-- `/score-global` — classement toutes périodes confondues
-- `/periodes` — liste des périodes
+### Fiabilité des interactions — v0.13.2
 
-Commandes admin :
+Les interactions susceptibles d’effectuer des opérations plus lentes sont maintenant acquittées immédiatement auprès de Discord. Cela concerne `/passe`, `/designer`, la validation du formulaire `/lancer`, `/periodes` et la confirmation de `/reinitialiser`.
 
-- `/periode statut`
-- `/periode config` → **Jamais** ou **Nombre de manches**
+`/passe` utilise en plus un changement de meneur atomique afin d’éviter un double tirage si deux interactions arrivent presque simultanément. Le nouveau meneur tiré au sort est annoncé publiquement dans le salon et reçoit toujours ses instructions en message privé.
 
-Lorsqu’une période limitée se termine, son classement final est publié puis la période suivante commence à zéro. L’historique n’est jamais supprimé.
+`/periodes` calcule désormais la progression de toutes les périodes avec une seule requête agrégée.
 
-### Nombre d’essais
+### Captures dans les messages de manche — v0.13.1
 
-Commandes admin :
+Les messages différés ne dépendent plus d’une URL CDN Discord pour afficher la capture. Avant de publier un indice, le mode accéléré ou le résultat final, le bot récupère la pièce jointe du message initial puis **réuploade réellement l’image dans le nouveau message**. L’embed référence cette nouvelle pièce jointe avec `attachment://...`.
 
-- `/essais statut`
-- `/essais config` → **Illimité** ou **Nombre d’essais**
+Le mécanisme est identique pour une capture envoyée directement et pour une image fournie initialement par URL. Pour les manches existantes, le bot peut retrouver le message de lancement dans l’historique du salon lorsque sa référence n’est pas disponible.
 
-La valeur est copiée dans la manche au moment de `/lancer`. Une modification ultérieure ne change donc pas une manche en cours.
+## Aide et paramètres
 
-### Verdict des réponses
+`/aide` affiche les paramètres réellement appliqués : limite d’essais de la manche en cours (ou valeur par défaut), période active et progression, durée maximale de 7 jours, accélération à 24 h et nouveau barème à 1 point à partir de la 4e place.
 
-Après arbitrage :
+La version du bot est indiquée discrètement en bas de l’aide.
 
-- une mauvaise réponse indique le nombre d’essais restants si la limite est active ;
-- une bonne réponse confirme que le jeu a été trouvé ;
-- dès que les réponses antérieures sont arbitrées et que le rang ne peut plus changer, le bot confirme la position et les points du joueur en privé.
+## Mise à jour
 
-Les points ne deviennent visibles sur le classement public qu’à la clôture de la manche.
+### Depuis v0.13.1
 
-### Meneur
-
-Chaque nouveau meneur reçoit un DM indiquant dynamiquement le nom du salon du jeu et les deux options :
-
-- `/lancer`
-- `/passe`
-
-## Mise à jour depuis v0.11.x
-
-1. Sauvegarder `data/scoreboard.db` par précaution.
-2. Remplacer `bot.py` et `database.py`.
-3. Redémarrer le conteneur.
-4. Vérifier dans les logs :
+1. Remplacer `bot.py` **et** `database.py`.
+2. Redémarrer le conteneur.
+3. Vérifier dans les logs :
 
 ```text
-Scoreboard bot version 0.12.1-periods-attempts
+Scoreboard bot version 0.13.2-interaction-timeouts
 ```
 
-La migration SQLite est automatique. Aucune modification de `.env` n’est nécessaire.
+Aucune migration du schéma SQLite et aucune modification de `.env` ne sont nécessaires. `database.py` doit tout de même être remplacé car cette version ajoute les opérations atomiques et la requête optimisée utilisées par le bot.
+
+### Depuis v0.12.1 ou une version antérieure
+
+Remplacer `bot.py` **et** `database.py`, puis redémarrer le conteneur. Les migrations SQLite introduites par les versions intermédiaires seront appliquées automatiquement.
 
 ## Synology
 
 Avec les bind mounts déjà utilisés sur le NAS, aucune reconstruction de l’image n’est nécessaire : remplacez les fichiers Python puis redémarrez simplement le conteneur.
-
-
-## Aide dynamique
-
-`/aide` affiche désormais les paramètres réellement appliqués : limite d’essais de la manche en cours (ou valeur par défaut), période active et progression, durée maximale de 7 jours et accélération à 24 h. La version du bot est indiquée discrètement en bas de l’aide.
