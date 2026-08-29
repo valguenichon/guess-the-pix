@@ -1,4 +1,4 @@
-# Guess the Pix — Discord bot v0.12.1
+# Guess the Pix — Discord bot v0.13.2
 
 Bot Discord mono-serveur pour un jeu de découverte de jeux vidéo à partir de captures d’écran.
 
