@@ -5,6 +5,7 @@ import io
 import logging
 import mimetypes
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import aiohttp
@@ -15,7 +16,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.13.2-interaction-timeouts"
+BOT_VERSION = "0.13.3-image-cache"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -550,7 +551,7 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
         # acquitté avant toute opération réseau potentiellement lente.
         await interaction.response.defer(thinking=True)
         try:
-            upload_file = await self.bot.prepare_round_image(self.capture, self.image_url)
+            image_data, image_filename = await self.bot.prepare_round_image_payload(self.capture, self.image_url)
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
@@ -580,20 +581,20 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             hint_3_scheduled_at=hint_3_at.isoformat(),
         )
 
-        embed = discord.Embed(
-            title=f"🎮 Manche #{round_id}",
-            description=(
-                f"Proposée par {interaction.user.mention}\n"
-                f"**Pour participer :** utilisez les boutons ci-dessous, ou **`/participer`** puis **`/reponse`**.\n"
-                f"💡 Trois indices sont prévus à **J+2, J+4 et J+6**.\n"
-                f"⚡ Dès la première bonne réponse validée, il restera **24 h maximum** et les indices encore cachés seront rapprochés.\n"
-                f"🎯 Essais : **{'illimités' if attempt_limit is None else str(attempt_limit) + ' par joueur'}**.\n\n"
-                f"Fin maximale : <t:{int(ends.timestamp())}:F> — <t:{int(ends.timestamp())}:R>"
-            ),
+        await self.bot.save_round_image_cache(round_id, image_data, image_filename)
+        upload_file = self.bot.make_discord_file(image_data, image_filename)
+
+        round_content = (
+            f"## 🎮 Manche #{round_id}\n"
+            f"Proposée par {interaction.user.mention}\n"
+            f"**Pour participer :** utilisez les boutons ci-dessous, ou **`/participer`** puis **`/reponse`**.\n"
+            f"💡 Trois indices sont prévus à **J+2, J+4 et J+6**.\n"
+            f"⚡ Dès la première bonne réponse validée, il restera **24 h maximum** et les indices encore cachés seront rapprochés.\n"
+            f"🎯 Essais : **{'illimités' if attempt_limit is None else str(attempt_limit) + ' par joueur'}**.\n\n"
+            f"Fin maximale : <t:{int(ends.timestamp())}:F> — <t:{int(ends.timestamp())}:R>"
         )
-        embed.set_image(url=f"attachment://{upload_file.filename}")
         message = await interaction.followup.send(
-            embed=embed,
+            content=round_content,
             file=upload_file,
             view=RoundActionsView(self.bot),
             wait=True,
@@ -611,6 +612,8 @@ class ScoreBot(commands.Bot):
         intents = discord.Intents.default()
         super().__init__(command_prefix="!", intents=intents)
         self.command_mentions: dict[str, str] = {}
+        self.round_images_dir = config.database_path.parent / "round_images"
+        self.round_images_dir.mkdir(parents=True, exist_ok=True)
 
     def command_mention(self, name: str) -> str:
         return self.command_mentions.get(name, f"`/{name}`")
@@ -660,11 +663,42 @@ class ScoreBot(commands.Bot):
 
         self.close_due_rounds.start()
 
-    async def prepare_round_image(
+    def make_discord_file(self, data: bytes, filename: str) -> discord.File:
+        return discord.File(io.BytesIO(data), filename=filename)
+
+    def round_image_cache_path(self, round_id: int, filename: str) -> Path:
+        safe_name = filename.strip().replace(chr(92), "_").replace("/", "_") or "capture.png"
+        suffix = Path(safe_name).suffix or ".png"
+        return self.round_images_dir / f"round_{round_id}{suffix}"
+
+    async def save_round_image_cache(self, round_id: int, data: bytes, filename: str) -> Path:
+        path = self.round_image_cache_path(round_id, filename)
+        for existing in self.round_images_dir.glob(f"round_{round_id}.*"):
+            if existing != path:
+                try:
+                    existing.unlink()
+                except OSError:
+                    pass
+        path.write_bytes(data)
+        logger.info("Round %s image cached locally at %s", round_id, path)
+        return path
+
+    async def load_round_image_cache(self, round_id: int) -> tuple[bytes, str] | None:
+        for path in sorted(self.round_images_dir.glob(f"round_{round_id}.*")):
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if data:
+                logger.info("Round %s image loaded from local cache", round_id)
+                return data, path.name
+        return None
+
+    async def prepare_round_image_payload(
         self,
         capture: discord.Attachment | None,
         image_url: str | None,
-    ) -> discord.File:
+    ) -> tuple[bytes, str]:
         if capture is None and not image_url:
             raise ValueError("Vous devez fournir soit une image, soit une URL d’image.")
         if capture is not None and image_url:
@@ -715,17 +749,25 @@ class ScoreBot(commands.Bot):
             ext = mimetypes.guess_extension(content_type or "") or ".png"
             filename = f"{filename}{ext}"
 
-        return discord.File(io.BytesIO(data), filename=filename)
+        return data, filename
+
+    async def prepare_round_image(
+        self,
+        capture: discord.Attachment | None,
+        image_url: str | None,
+    ) -> discord.File:
+        data, filename = await self.prepare_round_image_payload(capture, image_url)
+        return self.make_discord_file(data, filename)
 
     async def prepare_round_repost_image(self, round_row) -> discord.File | None:
-        """Build a fresh Discord upload for a round screenshot.
+        """Build a fresh Discord upload for a round screenshot."""
+        round_id = int(round_row["id"])
 
-        Delayed messages must not depend on an attachment CDN URL: Discord attachment
-        URLs are signed and can expire. We therefore fetch the original round message,
-        download its attachment bytes, and upload those bytes again with the new
-        hint/acceleration/result message. Rounds created before v0.13.0 can still have
-        their original message located from channel history.
-        """
+        cached = await self.load_round_image_cache(round_id)
+        if cached is not None:
+            data, filename = cached
+            return self.make_discord_file(data, filename)
+
         channel = self.get_channel(int(round_row["channel_id"]))
         if channel is None:
             try:
@@ -744,8 +786,6 @@ class ScoreBot(commands.Bot):
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     source_message = None
 
-            # Migration path for a round already in progress when round_message_id
-            # was introduced. Find the original launch message once and persist it.
             if source_message is None and hasattr(channel, "history"):
                 started_at = datetime.fromisoformat(round_row["started_at"])
                 after = started_at - timedelta(minutes=2)
@@ -759,11 +799,13 @@ class ScoreBot(commands.Bot):
                             continue
                         if not message.attachments:
                             continue
-                        if not any(embed.title == expected_title for embed in message.embeds):
+                        has_legacy_embed = any(embed.title == expected_title for embed in message.embeds)
+                        has_plain_launch = (message.content or "").startswith(f"## {expected_title}")
+                        if not has_legacy_embed and not has_plain_launch:
                             continue
                         source_message = message
                         await db.update_round_message_reference(
-                            int(round_row["id"]),
+                            round_id,
                             int(message.id),
                             message.attachments[0].url,
                         )
@@ -774,14 +816,12 @@ class ScoreBot(commands.Bot):
         if source_message is not None and source_message.attachments:
             attachment = source_message.attachments[0]
             await db.update_round_message_reference(
-                int(round_row["id"]), int(source_message.id), attachment.url
+                round_id, int(source_message.id), attachment.url
             )
             try:
-                # Fetching the message first gives us a current signed attachment URL.
                 data = await attachment.read()
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 try:
-                    # Discord's media proxy can sometimes outlive the direct CDN URL.
                     data = await attachment.read(use_cached=True)
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     data = b""
@@ -793,10 +833,9 @@ class ScoreBot(commands.Bot):
                     content_type = attachment.content_type or ""
                     ext = mimetypes.guess_extension(content_type) or ".png"
                     filename = f"{filename}{ext}"
-                return discord.File(io.BytesIO(data), filename=filename)
+                await self.save_round_image_cache(round_id, data, filename)
+                return self.make_discord_file(data, filename)
 
-        # Compatibility fallback for a deleted/unavailable original message. This is
-        # intentionally only a last resort because the stored URL may already be stale.
         fallback_url = round_row["image_url"]
         if fallback_url:
             timeout = aiohttp.ClientTimeout(total=20)
@@ -808,7 +847,9 @@ class ScoreBot(commands.Bot):
                             if data:
                                 content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
                                 ext = mimetypes.guess_extension(content_type) or ".png"
-                                return discord.File(io.BytesIO(data), filename=f"capture{ext}")
+                                filename = f"round_{round_id}{ext}"
+                                await self.save_round_image_cache(round_id, data, filename)
+                                return self.make_discord_file(data, filename)
             except (asyncio.TimeoutError, aiohttp.ClientError):
                 pass
 
@@ -1200,18 +1241,15 @@ class ScoreBot(commands.Bot):
                 channel = None
 
         if isinstance(channel, discord.abc.Messageable):
-            embed = discord.Embed(
-                title=f"⚡ Manche #{round_id} - Le jeu s’accélère !",
-                description=(
-                    "Une première bonne réponse a été validée. Son auteur reste secret jusqu’à la fin.\n\n"
-                    f"Les autres participants ont désormais jusqu’à <t:{int(effective_end.timestamp())}:F> "
-                    f"(<t:{int(effective_end.timestamp())}:R>) pour répondre.\n"
-                    "Les indices encore cachés sont rapprochés en conséquence."
-                ),
-                timestamp=accelerated_at,
+            acceleration_content = (
+                f"## ⚡ Manche #{round_id} - Le jeu s’accélère !\n"
+                "Une première bonne réponse a été validée. Son auteur reste secret jusqu’à la fin.\n\n"
+                f"Les autres participants ont désormais jusqu’à <t:{int(effective_end.timestamp())}:F> "
+                f"(<t:{int(effective_end.timestamp())}:R>) pour répondre.\n"
+                "Les indices encore cachés sont rapprochés en conséquence."
             )
-            image_file = await self.attach_round_image(embed, refreshed)
-            send_kwargs = {"embed": embed, "view": RoundActionsView(self)}
+            image_file = await self.prepare_round_repost_image(refreshed)
+            send_kwargs = {"content": acceleration_content, "view": RoundActionsView(self)}
             if image_file is not None:
                 send_kwargs["file"] = image_file
             try:
@@ -1251,16 +1289,13 @@ class ScoreBot(commands.Bot):
                     continue
 
                 remaining_points = {1: "5 / 4 / 3", 2: "4 / 3 / 2", 3: "3 / 2 / 1"}[hint_number]
-                embed = discord.Embed(
-                    title=f"💡 Manche #{round_row['id']} - Indice {hint_number}/3",
-                    description=round_row[f"hint_{hint_number}"],
-                    timestamp=now,
+                hint_content = (
+                    f"💡 Manche #{round_row['id']} - Indice {hint_number}/3\n\n"
+                    f"**{round_row[f'hint_{hint_number}']}**\n\n"
+                    f"*Barème du podium à partir de maintenant : {remaining_points} points • 1 pt à partir de la 4e place*"
                 )
-                embed.set_footer(
-                    text=f"Barème du podium à partir de maintenant : {remaining_points} points • 1 pt à partir de la 4e place"
-                )
-                image_file = await self.attach_round_image(embed, round_row)
-                send_kwargs = {"embed": embed, "view": RoundActionsView(self)}
+                image_file = await self.prepare_round_repost_image(round_row)
+                send_kwargs = {"content": hint_content, "view": RoundActionsView(self)}
                 if image_file is not None:
                     send_kwargs["file"] = image_file
                 try:
@@ -1440,16 +1475,9 @@ class ScoreBot(commands.Bot):
         attempt_count = await db.count_attempts(round_id)
         correct_count = len(winners)
 
-        embed = discord.Embed(
-            title=f"🏁 Résultats — Manche #{round_id}",
-            description=f"La réponse était **{round_row['solution']}**.",
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(
-            name="Meneur de la manche",
-            value=f"<@{round_row['master_id']}>",
-            inline=False,
-        )
+        result_lines = [
+            f"**🎮 Meneur de la manche**\n<@{round_row['master_id']}>"
+        ]
 
         if podium:
             medals = ["🥇", "🥈", "🥉"]
@@ -1463,12 +1491,11 @@ class ScoreBot(commands.Bot):
                     f"{medals[i]} <@{row['user_id']}> — **+{points} pt{'s' if points > 1 else ''}** "
                     f"— trouvé en **{elapsed}**, {timing_label}"
                 )
-            embed.add_field(name="Podium", value="\n".join(podium_lines), inline=False)
+            result_lines.append("**🏆 Podium**\n" + "\n".join(podium_lines))
         else:
-            embed.add_field(
-                name="Introuvable",
-                value=f"Personne n’a trouvé : <@{round_row['master_id']}> gagne **+4 points**.",
-                inline=False,
+            result_lines.append(
+                "**🔒 Introuvable**\n"
+                f"Personne n’a trouvé : <@{round_row['master_id']}> gagne **+4 points**."
             )
 
         other_correct = max(0, correct_count - len(podium))
@@ -1486,13 +1513,13 @@ class ScoreBot(commands.Bot):
                 f"👏 **{other_correct}** autre{'s' if other_correct != 1 else ''} bonne{'s' if other_correct != 1 else ''} "
                 f"réponse{'s' if other_correct != 1 else ''} au-delà du podium — **+1 pt chacun**"
             )
-        embed.add_field(name="Bilan de la manche", value="\n".join(bilan_lines), inline=False)
-        embed.add_field(name="Prochaine manche", value=next_master_reason, inline=False)
-
-        image_file = await self.attach_round_image(embed, round_row)
-        embed.set_footer(
-            text="Le podium dépend du rang et des indices révélés ; à partir de la 4e place, toute bonne réponse rapporte 1 point."
+        result_lines.append("**📊 Bilan de la manche**\n" + "\n".join(bilan_lines))
+        result_lines.append("**🎮 Prochaine manche**\n" + next_master_reason)
+        result_lines.append(
+            "*Le podium dépend du rang et des indices révélés ; à partir de la 4e place, toute bonne réponse rapporte 1 point.*"
         )
+
+        image_file = await self.prepare_round_repost_image(round_row)
 
         channel = self.get_channel(round_row["channel_id"])
         if channel is None:
@@ -1501,10 +1528,15 @@ class ScoreBot(commands.Bot):
             except discord.HTTPException:
                 channel = None
         if isinstance(channel, discord.abc.Messageable):
-            send_kwargs = {"embed": embed}
+            result_content = (
+                f"# 🎮 {round_row['solution']}\n"
+                f"## Manche #{round_id} terminée !"
+            )
             if image_file is not None:
-                send_kwargs["file"] = image_file
-            await channel.send(**send_kwargs)
+                await channel.send(content=result_content, file=image_file)
+            else:
+                await channel.send(content=result_content)
+            await channel.send(content="\n\n".join(result_lines))
 
         # Une période limitée se clôture une fois son nombre de manches atteint.
         period = await db.get_current_period(round_row["guild_id"])
