@@ -793,6 +793,26 @@ class Database:
             await db.commit()
             return int(cursor.lastrowid)
 
+    async def delete_pending_attempt(self, attempt_id: int) -> bool:
+        """Supprime une tentative qui n'a pas pu être remise au meneur."""
+        async with self.connection() as db:
+            cursor = await db.execute(
+                "DELETE FROM attempts WHERE id = ? AND status = 'pending'",
+                (attempt_id,),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def delete_pending_attempts(self, round_id: int) -> int:
+        """Supprime les validations encore en attente lors d'une clôture forcée."""
+        async with self.connection() as db:
+            cursor = await db.execute(
+                "DELETE FROM attempts WHERE round_id = ? AND status = 'pending'",
+                (round_id,),
+            )
+            await db.commit()
+            return int(cursor.rowcount)
+
     async def get_attempt(self, attempt_id: int):
         async with self.connection() as db:
             return await (await db.execute(

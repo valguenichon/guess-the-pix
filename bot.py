@@ -1074,7 +1074,7 @@ class ScoreBot(commands.Bot):
         attempt_id: int,
         player: discord.abc.User,
         answer: str,
-    ) -> None:
+    ) -> bool:
         leader = self.get_user(round_row["master_id"])
         if leader is None:
             try:
@@ -1091,7 +1091,7 @@ class ScoreBot(commands.Bot):
             try:
                 await leader.send(embed=embed, view=ValidationView(attempt_id))
                 delivered = True
-            except discord.Forbidden:
+            except (discord.Forbidden, discord.HTTPException):
                 pass
 
         if not delivered:
@@ -1104,6 +1104,8 @@ class ScoreBot(commands.Bot):
                     )
                 except discord.HTTPException:
                     pass
+
+        return delivered
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         data = interaction.data or {}
@@ -1319,7 +1321,7 @@ class ScoreBot(commands.Bot):
     async def before_close_due_rounds(self) -> None:
         await self.wait_until_ready()
 
-    async def lock_round_and_maybe_finish(self, round_id: int) -> bool:
+    async def lock_round_and_maybe_finish(self, round_id: int, force: bool = False) -> bool:
         round_row = await db.get_round(round_id)
         if not round_row or round_row["status"] == "closed":
             return False
@@ -1329,6 +1331,18 @@ class ScoreBot(commands.Bot):
             round_row = await db.get_round(round_id)
 
         pending = await db.pending_attempts(round_id)
+        if pending and force:
+            # /cloturer forcer:Oui est le filet de sécurité contre toute validation
+            # orpheline (y compris celles créées par une ancienne version du bot).
+            for attempt in pending:
+                await self.send_player_message(
+                    attempt["user_id"],
+                    "⚠️ **Manche clôturée par un administrateur.**\n"
+                    "Ta réponse encore en attente de validation n’a pas été comptabilisée.",
+                )
+            await db.delete_pending_attempts(round_id)
+            pending = []
+
         if pending:
             master = self.get_user(round_row["master_id"])
             if master is None:
@@ -1784,14 +1798,32 @@ async def answer(interaction: discord.Interaction, reponse: str):
         await interaction.response.send_message("La réponse est limitée à 200 caractères.", ephemeral=True)
         return
 
+    # Le DM de validation fait partie de l'enregistrement logique de la réponse.
+    # On acquitte d'abord l'interaction Discord, puis on ne conserve la tentative
+    # que si le meneur a réellement reçu les boutons de validation.
+    await interaction.response.defer(ephemeral=True)
     attempt_id = await db.create_attempt(
         interaction.guild_id, round_row["id"], interaction.user.id, answer_text
     )
-    await interaction.response.send_message(
+    delivered = await bot.notify_leader(round_row, attempt_id, interaction.user, answer_text)
+    if not delivered:
+        await db.delete_pending_attempt(attempt_id)
+        # Une tentative éphémèrement pending a pu retarder la confirmation d'un
+        # résultat validé au même instant : recalculer après sa suppression.
+        await bot.finalize_confirmable_results(round_row["id"])
+        await bot.update_scoreboard(interaction.guild_id)
+        await interaction.followup.send(
+            "Impossible de transmettre ta réponse au meneur en message privé. "
+            "Ta réponse n’a pas été enregistrée et cet essai n’est pas consommé. "
+            "Le meneur doit autoriser les messages privés de ce serveur avant que tu réessaies.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
         "Réponse enregistrée. Le meneur va l’examiner et tu recevras son verdict en privé.",
         ephemeral=True,
     )
-    await bot.notify_leader(round_row, attempt_id, interaction.user, answer_text)
     await bot.update_scoreboard(interaction.guild_id)
 
 
@@ -2111,7 +2143,8 @@ async def reset_game(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="cloturer", description="Clôturer immédiatement la manche en cours")
-async def close_now(interaction: discord.Interaction):
+@app_commands.describe(forcer="Ignorer les réponses encore en attente de validation")
+async def close_now(interaction: discord.Interaction, forcer: bool = False):
     if interaction.guild_id is None or not is_admin(interaction):
         await interaction.response.send_message("Commande réservée au rôle Admin du jeu ou aux administrateurs du serveur.", ephemeral=True)
         return
@@ -2120,12 +2153,22 @@ async def close_now(interaction: discord.Interaction):
         await interaction.response.send_message("Aucune manche en cours.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    finalized = await bot.lock_round_and_maybe_finish(round_row["id"])
+    pending_count = len(await db.pending_attempts(round_row["id"]))
+    finalized = await bot.lock_round_and_maybe_finish(round_row["id"], force=forcer)
     if finalized:
-        await interaction.followup.send("Manche clôturée et résultats publiés.", ephemeral=True)
+        if forcer and pending_count:
+            await interaction.followup.send(
+                f"Manche clôturée et résultats publiés. "
+                f"{pending_count} réponse(s) encore en attente ont été ignorées.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send("Manche clôturée et résultats publiés.", ephemeral=True)
     else:
         await interaction.followup.send(
-            "Les réponses sont maintenant fermées. La publication attend les validations restantes du meneur.",
+            "Les réponses sont maintenant fermées. La publication attend les validations restantes du meneur.\n"
+            "Pour sortir d’un blocage, relance `/cloturer` avec **forcer = Oui** : "
+            "les réponses encore en attente seront ignorées et la manche sera terminée.",
             ephemeral=True,
         )
 
