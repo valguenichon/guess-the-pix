@@ -16,7 +16,8 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "0.13.3-image-cache"
+BOT_VERSION = "1.0.0"
+ADMIN_ROLE_NAME = "Guess the Pix - admin"
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -146,14 +147,13 @@ def is_admin(interaction: discord.Interaction) -> bool:
     if not isinstance(interaction.user, discord.Member):
         return False
 
-    # Administration du jeu : rôle Discord dédié.
-    if config.game_admin_role_id is not None:
+    guild_cfg = bot.guild_configs.get(interaction.guild_id) if interaction.guild_id else None
+    admin_role_id = guild_cfg.get("admin_role_id") if guild_cfg else None
+    if admin_role_id is not None:
         role_ids = {role.id for role in interaction.user.roles}
-        if config.game_admin_role_id in role_ids:
+        if int(admin_role_id) in role_ids:
             return True
 
-    # Filet de sécurité : les administrateurs du serveur et les membres
-    # ayant la permission Gérer le serveur conservent aussi l'accès.
     return bool(
         interaction.user.guild_permissions.administrator
         or interaction.user.guild_permissions.manage_guild
@@ -186,79 +186,100 @@ async def random_registered_participant(guild: discord.Guild, excluded: set[int]
 async def build_help_text(interaction: discord.Interaction) -> str:
     settings: list[str] = []
     if interaction.guild_id is not None:
-        state = await db.get_state(interaction.guild_id)
-        period = await db.get_current_period(interaction.guild_id)
-        progress, period_limit = await db.period_progress(period["id"])
-        active_round = await db.get_active_round(interaction.guild_id)
-
-        if active_round is not None:
-            attempt_limit = active_round["attempt_limit"]
-            attempt_label = (
-                "**illimités** pour la manche en cours"
-                if attempt_limit is None
-                else f"**{attempt_limit} par joueur** pour la manche en cours"
-            )
+        guild_cfg = bot.guild_configs.get(interaction.guild_id)
+        if guild_cfg is None:
+            registration = await db.get_guild_registration(interaction.guild_id)
+            status = str(registration["status"]) if registration else "pending"
+            if status == "approved":
+                status_line = "✅ Serveur autorisé : un administrateur peut utiliser `/configurer`."
+            elif status == "blocked":
+                status_line = "⛔ Ce serveur est bloqué par le propriétaire de Guess the Pix."
+            elif status == "refused":
+                status_line = "❌ La demande de ce serveur a été refusée par le propriétaire de Guess the Pix."
+            else:
+                status_line = "⏳ Ce serveur attend l’autorisation du propriétaire de Guess the Pix."
+            settings = [
+                "**Configuration**",
+                "Guess the Pix n’est pas encore configuré sur ce serveur.",
+                status_line,
+                "",
+            ]
         else:
-            attempt_limit = state["default_attempt_limit"]
-            attempt_label = (
-                "**illimités**"
-                if attempt_limit is None
-                else f"**{attempt_limit} par joueur**"
-            )
+            state = await db.get_state(interaction.guild_id)
+            period = await db.get_current_period(interaction.guild_id)
+            progress, period_limit = await db.period_progress(period["id"])
+            active_round = await db.get_active_round(interaction.guild_id)
 
-        if period_limit is None:
-            period_label = f"**Période {period['number']}** — sans limite de manches"
-        else:
-            period_label = f"**Période {period['number']}** — **{progress}/{period_limit} manches**"
+            if active_round is not None:
+                attempt_limit = active_round["attempt_limit"]
+                attempt_label = (
+                    "**illimités** pour la manche en cours"
+                    if attempt_limit is None
+                    else f"**{attempt_limit} par joueur** pour la manche en cours"
+                )
+            else:
+                attempt_limit = state["default_attempt_limit"]
+                attempt_label = (
+                    "**illimités**"
+                    if attempt_limit is None
+                    else f"**{attempt_limit} par joueur**"
+                )
 
-        settings = [
-            "**Paramètres actuels**",
-            f"🎯 Essais : {attempt_label}",
-            f"🗓️ Classement : {period_label}",
-            "⏱️ Durée maximale d’une manche : **7 jours**",
-            "⚡ Accélération : **24 h maximum après la première bonne réponse validée**",
-            "",
-        ]
+            if period_limit is None:
+                period_label = f"**Période {period['number']}** — sans limite de manches"
+            else:
+                period_label = f"**Période {period['number']}** — **{progress}/{period_limit} manches**"
+
+            settings = [
+                "**Paramètres actuels**",
+                f"🎯 Essais : {attempt_label}",
+                f"🗓️ Classement : {period_label}",
+                "⏱️ Durée maximale d’une manche : **7 jours**",
+                "⚡ Accélération : **24 h maximum après la première bonne réponse validée**",
+                "",
+            ]
 
     text = settings + [
         "**Règles en bref**",
         "• **`/participer`** est requis pour répondre et être tiré au sort.",
-        "• Manche : **7 jours max**, indices à **J+2/J+4/J+6** ; après la 1re bonne réponse validée, fin sous **24 h max**.",
-        "• Essais : **illimités ou limités** selon la manche.",
+        "• Manche : **7 j max**, indices J+2/J+4/J+6 ; après la 1re bonne réponse validée : **24 h max**.",
+        "• Essais : **illimités ou limités**.",
         "• Verdict envoyé en privé après validation.",
-        "• Podium : **6/5/4** avant tout indice, puis **5/4/3**, **4/3/2**, et **3/2/1** après le 3e ; **1 pt à partir de la 4e place**.",
+        "• Points : **6/5/4**, puis **5/4/3**, **4/3/2**, **3/2/1** selon les indices ; **1 pt dès la 4e place**.",
         "• Si personne ne trouve : **+4 pts au meneur**.",
-        "• Le 1er devient meneur ; s’il passe, un participant est tiré au sort.",
-        "• Classement par **périodes** ; `/score` affiche la période en cours.",
+        "• Le 1er devient meneur ; `/passe` déclenche un tirage.",
+        "• `/score` affiche la **période** en cours.",
         "",
         "**Commandes du meneur**",
-        "`/lancer image:...` ou `/lancer url:...` — lancer une manche et saisir ses 3 indices",
+        "`/lancer` — choisir `capture` ou `url` ; le jeu et les 3 indices sont demandés ensuite.",
         "`/passe` — passer la main avant de lancer la manche",
         "",
         "**Commandes joueurs**",
-        "`/participer` — s’inscrire au jeu",
-        "`/quitter` — se désinscrire du jeu",
-        "`/participants` — afficher la liste des participants inscrits",
+        "`/participer` — s’inscrire",
+        "`/quitter` — se désinscrire",
+        "`/participants` — liste des participants",
         "`/reponse` — proposer une réponse secrète",
-        "`/score` — classement de la période actuelle ou d’une période choisie",
-        "`/score-global` — classement toutes périodes confondues",
-        "`/periodes` — afficher les périodes disponibles",
+        "`/score` — classement par période",
+        "`/score-global` — classement global",
+        "`/periodes` — périodes disponibles",
         "`/meneur` — afficher le meneur actuel",
-        "`/historique` — afficher les dernières manches",
+        "`/historique` — dernières manches",
     ]
     if is_admin(interaction):
         text += [
             "",
             "**Administration**",
+            "`/config statut` — configuration du serveur",
             "`/designer @joueur` — désigner le meneur",
-            "`/corriger @joueur points:` — corriger le score de la période actuelle",
-            "`/periode statut` / `config` — configurer la durée des périodes",
-            "`/essais statut` / `config` — configurer le nombre d’essais par joueur",
-            "`/cloturer` — clôturer immédiatement la manche",
-            "`/tableau` — créer ou actualiser le scoreboard permanent",
-            "`/reinitialiser` — remettre entièrement le jeu à zéro",
+            "`/corriger @joueur points:` — corriger un score",
+            "`/periode` — configurer les périodes",
+            "`/essais` — configurer les essais",
+            "`/cloturer` — clôturer la manche",
+            "`/tableau` — gérer le scoreboard",
+            "`/reinitialiser` — remettre le jeu à zéro",
         ]
-    text += ["", f"*Guess the Pix • v{BOT_VERSION.split('-', 1)[0]}*"]
+    env_suffix = " • STAGING" if config.environment == "staging" else ""
+    text += ["", f"*Guess the Pix • v{BOT_VERSION.split('-', 1)[0]}{env_suffix}*"]
     return "\n".join(text)
 
 
@@ -357,7 +378,7 @@ class RoundActionsView(discord.ui.View):
         if not await self._check_context(interaction):
             return
         if not await db.is_participant_active(interaction.guild_id, interaction.user.id):
-            participate = self.bot.command_mention("participer")
+            participate = self.bot.command_mention("participer", interaction.guild_id)
             await interaction.response.send_message(
                 f"Tu dois d’abord t’inscrire avec {participate}.",
                 ephemeral=True,
@@ -392,7 +413,7 @@ class RoundActionsView(discord.ui.View):
                 )
                 return
 
-        answer_command = self.bot.command_mention("reponse")
+        answer_command = self.bot.command_mention("reponse", interaction.guild_id)
         await interaction.response.send_message(
             f"💡 Utilise {answer_command} pour proposer secrètement le nom du jeu.",
             ephemeral=True,
@@ -581,11 +602,13 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             hint_3_scheduled_at=hint_3_at.isoformat(),
         )
 
-        await self.bot.save_round_image_cache(round_id, image_data, image_filename)
+        created_round = await db.get_round(round_id)
+        round_number = int(created_round["round_number"] or round_id)
+        await self.bot.save_round_image_cache(interaction.guild_id, round_number, image_data, image_filename)
         upload_file = self.bot.make_discord_file(image_data, image_filename)
 
         round_content = (
-            f"## 🎮 Manche #{round_id}\n"
+            f"## 🎮 Manche #{round_number}\n"
             f"Proposée par {interaction.user.mention}\n"
             f"**Pour participer :** utilisez les boutons ci-dessous, ou **`/participer`** puis **`/reponse`**.\n"
             f"💡 Trois indices sont prévus à **J+2, J+4 et J+6**.\n"
@@ -607,54 +630,245 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
         await self.bot.update_scoreboard(interaction.guild_id)
 
 
+class AccessControlledTree(app_commands.CommandTree):
+    """Bloque les commandes de jeu tant qu'un serveur n'est pas configuré."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Ces commandes doivent rester accessibles avant la configuration afin
+        # de consulter l'état, demander la configuration ou administrer les accès.
+        root_name = str((interaction.data or {}).get("name", ""))
+        if root_name in {"aide", "configurer", "config", "proprietaire"}:
+            return True
+        if interaction.guild_id is None:
+            return True
+
+        registration = await db.get_guild_registration(interaction.guild_id)
+        status = str(registration["status"]) if registration else "pending"
+        if status == "configured":
+            return True
+
+        if status == "approved":
+            message = "✅ Ce serveur est autorisé mais pas encore configuré. Un administrateur doit utiliser `/configurer`."
+        elif status == "blocked":
+            message = "⛔ Ce serveur est bloqué et ne peut pas utiliser Guess the Pix."
+        elif status == "refused":
+            message = "❌ La demande de ce serveur a été refusée. Une nouvelle installation créera une nouvelle demande."
+        else:
+            message = "⏳ Ce serveur attend l’autorisation du propriétaire de Guess the Pix."
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+        return False
+
+
 class ScoreBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, tree_cls=AccessControlledTree)
         self.command_mentions: dict[str, str] = {}
+        self.guild_command_mentions: dict[int, dict[str, str]] = {}
+        self.guild_configs: dict[int, dict[str, int | None]] = {}
+        self.bot_owner_user_id: int | None = config.bot_owner_user_id
+        self._guild_registry_reconciled = False
         self.round_images_dir = config.database_path.parent / "round_images"
         self.round_images_dir.mkdir(parents=True, exist_ok=True)
 
-    def command_mention(self, name: str) -> str:
+    def command_mention(self, name: str, guild_id: int | None = None) -> str:
+        if guild_id is not None:
+            guild_mentions = self.guild_command_mentions.get(guild_id)
+            if guild_mentions and name in guild_mentions:
+                return guild_mentions[name]
         return self.command_mentions.get(name, f"`/{name}`")
+
+    def uses_guild_scoped_commands(self) -> bool:
+        """Use instant guild commands outside production.
+
+        COMMAND_GUILD_IDS is only an optional pre-sync hint; it is never the
+        allow-list of staging guilds. Every guild the bot actually joins in
+        staging/development receives its own synchronized command set.
+        """
+        return config.environment in {"staging", "development"}
+
+    async def reload_guild_configs(self) -> None:
+        rows = await db.list_guild_configs()
+        self.guild_configs = {
+            int(row["guild_id"]): {
+                "game_channel_id": int(row["game_channel_id"]) if row["game_channel_id"] is not None else None,
+                "admin_role_id": int(row["admin_role_id"]) if row["admin_role_id"] is not None else None,
+            }
+            for row in rows
+        }
+
+    async def resolve_bot_owner_user_id(self) -> int | None:
+        if self.bot_owner_user_id is not None:
+            return self.bot_owner_user_id
+        try:
+            app_info = await self.application_info()
+        except discord.HTTPException:
+            logger.exception("Impossible de déterminer le propriétaire de l'application Discord.")
+            return None
+        if app_info.team is not None:
+            self.bot_owner_user_id = int(app_info.team.owner_id)
+        elif app_info.owner is not None:
+            self.bot_owner_user_id = int(app_info.owner.id)
+        return self.bot_owner_user_id
+
+    async def is_bot_owner_user(self, user_id: int) -> bool:
+        owner_id = await self.resolve_bot_owner_user_id()
+        return owner_id is not None and int(user_id) == owner_id
+
+    async def send_dm_to_user_id(self, user_id: int, message: str) -> bool:
+        user = self.get_user(int(user_id))
+        if user is None:
+            try:
+                user = await self.fetch_user(int(user_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return False
+        try:
+            await user.send(message)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
+    async def notify_access_request(self, guild: discord.Guild, *, previously_refused: bool = False) -> None:
+        owner_id = await self.resolve_bot_owner_user_id()
+        if owner_id is not None:
+            warning = (
+                "⚠️ **Ce serveur avait déjà été refusé.**\n\n"
+                if previously_refused else ""
+            )
+            await self.send_dm_to_user_id(
+                owner_id,
+                ("⚠️ **Nouvelle demande d’un serveur déjà refusé**\n" if previously_refused
+                 else "🆕 **Nouvelle demande Guess the Pix**\n")
+                + f"Serveur : **{guild.name}**\n"
+                + f"ID : `{guild.id}`\n"
+                + f"Propriétaire du serveur : <@{guild.owner_id}> (`{guild.owner_id}`)\n\n"
+                + warning
+                + "Pour autoriser : `/proprietaire autoriser serveur_id:" + str(guild.id) + "`\n"
+                + "Pour refuser : `/proprietaire refuser serveur_id:" + str(guild.id) + "`",
+            )
+
+        await self.send_dm_to_user_id(
+            guild.owner_id,
+            "⏳ **Guess the Pix est en attente d’autorisation.**\n"
+            f"Serveur : **{guild.name}**\n\n"
+            "Le propriétaire du bot doit autoriser ce serveur avant la configuration. "
+            "Une fois l’autorisation accordée, un administrateur pourra utiliser `/configurer`.",
+        )
+
+    async def process_guild_join(self, guild: discord.Guild) -> None:
+        previous_registration = await db.get_guild_registration(guild.id)
+        previous_status = (
+            str(previous_registration["status"]) if previous_registration is not None else None
+        )
+        status, new_request = await db.register_guild_join(guild.id, guild.name, guild.owner_id)
+        if status == "blocked":
+            await self.send_dm_to_user_id(
+                guild.owner_id,
+                "⛔ **Guess the Pix ne peut pas être installé sur ce serveur.**\n"
+                f"Serveur : **{guild.name}**",
+            )
+            logger.warning("Serveur bloque detecte lors de l'ajout : %s (%s)", guild.name, guild.id)
+            await guild.leave()
+            return
+        if status == "pending" and new_request:
+            logger.warning("Nouvelle demande serveur : %s (%s)", guild.name, guild.id)
+            await self.notify_access_request(guild, previously_refused=(previous_status == "refused"))
+
+    async def on_ready(self) -> None:
+        if self._guild_registry_reconciled:
+            return
+        self._guild_registry_reconciled = True
+        for guild in list(self.guilds):
+            try:
+                await self.process_guild_join(guild)
+                if self.uses_guild_scoped_commands():
+                    registration = await db.get_guild_registration(guild.id)
+                    status = str(registration["status"]) if registration else "pending"
+                    if status != "blocked":
+                        await self.sync_commands_to_guild(guild.id)
+            except Exception:
+                logger.exception("Erreur de réconciliation du serveur %s", guild.id)
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        await self.process_guild_join(guild)
+        # En staging/development, toute guild réellement rejointe reçoit
+        # immédiatement ses commandes. COMMAND_GUILD_IDS n'est qu'un indice
+        # facultatif de pré-synchronisation, jamais une allow-list.
+        if self.uses_guild_scoped_commands():
+            registration = await db.get_guild_registration(guild.id)
+            status = str(registration["status"]) if registration else "pending"
+            if status != "blocked":
+                await self.sync_commands_to_guild(guild.id)
+
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        await db.mark_guild_inactive(guild.id)
+        await self.reload_guild_configs()
+
+    async def sync_commands_to_guild(self, guild_id: int) -> bool:
+        guild = discord.Object(id=guild_id)
+        self.tree.copy_global_to(guild=guild)
+        try:
+            synced = await self.tree.sync(guild=guild)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+            # Un ID peut être préparé dans COMMAND_GUILD_IDS avant que
+            # l'application ne soit effectivement installée sur le serveur.
+            # Dans ce cas on laisse le bot démarrer et on retentera
+            # automatiquement dans on_guild_join().
+            logger.warning(
+                "Synchronisation des commandes impossible sur le serveur %s : %s",
+                guild_id,
+                exc,
+            )
+            return False
+
+        self.guild_command_mentions[guild_id] = {
+            command.name: f"</{command.name}:{command.id}>"
+            for command in synced if command.id
+        }
+        logger.warning(
+            "Commandes synchronisees sur le serveur de staging %s : %s",
+            guild_id,
+            ", ".join(sorted(command.name for command in synced)),
+        )
+        return True
 
     async def setup_hook(self) -> None:
         await db.init()
-        # Vue persistante : les boutons des anciennes manches restent actifs après redémarrage.
+        migrated = await db.migrate_legacy_config(
+            config.legacy_guild_id,
+            config.legacy_game_channel_id,
+            config.legacy_game_admin_role_id,
+        )
+        await self.reload_guild_configs()
+        if migrated:
+            logger.warning("Configuration mono-serveur v0.13.x migree vers guild_config.")
+
         self.add_view(RoundActionsView(self))
-        logger.warning("Scoreboard bot version %s", BOT_VERSION)
+        env_label = f" [{config.environment.upper()}]" if config.environment != "production" else ""
+        logger.warning("Scoreboard bot version %s%s", BOT_VERSION, env_label)
 
-        if config.guild_id:
-            guild = discord.Object(id=config.guild_id)
-
-            # Les commandes de ce bot doivent vivre uniquement sur ce serveur.
-            # On copie d'abord les définitions courantes vers le serveur puis on
-            # les synchronise. Cela remplace aussi les anciennes commandes de guilde.
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            self.command_mentions = {
-                command.name: f"</{command.name}:{command.id}>"
-                for command in synced
-                if command.id
-            }
-            logger.warning(
-                "Commandes synchronisees sur le serveur %s : %s",
-                config.guild_id,
-                ", ".join(sorted(command.name for command in synced)),
-            )
-
-            # Une ancienne version du bot a pu enregistrer les commandes globalement.
-            # On supprime explicitement ces anciennes commandes côté Discord afin
-            # d'éviter qu'elles restent visibles pendant leur délai de propagation.
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-            logger.warning("Anciennes commandes globales supprimees.")
+        if self.uses_guild_scoped_commands():
+            # Pré-synchronisation facultative : utile pour préparer un serveur
+            # avant l'invitation du bot, mais aucun ID n'est requis. Les guilds
+            # réellement connectées seront synchronisées dans on_ready() et
+            # toute nouvelle guild dans on_guild_join().
+            for guild_id in config.command_guild_ids:
+                await self.sync_commands_to_guild(guild_id)
+            if not config.command_guild_ids:
+                logger.warning(
+                    "COMMAND_GUILD_IDS non defini : les commandes staging seront "
+                    "synchronisees automatiquement sur les serveurs rejoints."
+                )
         else:
+            if config.command_guild_ids:
+                logger.warning(
+                    "COMMAND_GUILD_IDS est ignore en production : utilisation des commandes globales."
+                )
             synced = await self.tree.sync()
             self.command_mentions = {
                 command.name: f"</{command.name}:{command.id}>"
-                for command in synced
-                if command.id
+                for command in synced if command.id
             }
             logger.warning(
                 "Commandes globales synchronisees : %s",
@@ -666,32 +880,49 @@ class ScoreBot(commands.Bot):
     def make_discord_file(self, data: bytes, filename: str) -> discord.File:
         return discord.File(io.BytesIO(data), filename=filename)
 
-    def round_image_cache_path(self, round_id: int, filename: str) -> Path:
+    def round_image_cache_dir(self, guild_id: int) -> Path:
+        path = self.round_images_dir / str(guild_id)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def round_image_cache_path(self, guild_id: int, round_number: int, filename: str) -> Path:
         safe_name = filename.strip().replace(chr(92), "_").replace("/", "_") or "capture.png"
         suffix = Path(safe_name).suffix or ".png"
-        return self.round_images_dir / f"round_{round_id}{suffix}"
+        return self.round_image_cache_dir(guild_id) / f"round_{round_number}{suffix}"
 
-    async def save_round_image_cache(self, round_id: int, data: bytes, filename: str) -> Path:
-        path = self.round_image_cache_path(round_id, filename)
-        for existing in self.round_images_dir.glob(f"round_{round_id}.*"):
+    async def save_round_image_cache(self, guild_id: int, round_number: int, data: bytes, filename: str) -> Path:
+        directory = self.round_image_cache_dir(guild_id)
+        path = self.round_image_cache_path(guild_id, round_number, filename)
+        for existing in directory.glob(f"round_{round_number}.*"):
             if existing != path:
                 try:
                     existing.unlink()
                 except OSError:
                     pass
         path.write_bytes(data)
-        logger.info("Round %s image cached locally at %s", round_id, path)
+        logger.info("Guild %s round %s image cached locally at %s", guild_id, round_number, path)
         return path
 
-    async def load_round_image_cache(self, round_id: int) -> tuple[bytes, str] | None:
-        for path in sorted(self.round_images_dir.glob(f"round_{round_id}.*")):
+    async def load_round_image_cache(self, guild_id: int, round_number: int, legacy_round_id: int | None = None) -> tuple[bytes, str] | None:
+        directory = self.round_image_cache_dir(guild_id)
+        for path in sorted(directory.glob(f"round_{round_number}.*")):
             try:
                 data = path.read_bytes()
             except OSError:
                 continue
             if data:
-                logger.info("Round %s image loaded from local cache", round_id)
+                logger.info("Guild %s round %s image loaded from local cache", guild_id, round_number)
                 return data, path.name
+        # Migration opportuniste du cache mono-serveur v0.13.3.
+        if legacy_round_id is not None:
+            for path in sorted(self.round_images_dir.glob(f"round_{legacy_round_id}.*")):
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    continue
+                if data:
+                    target = await self.save_round_image_cache(guild_id, round_number, data, path.name)
+                    return data, target.name
         return None
 
     async def prepare_round_image_payload(
@@ -762,8 +993,10 @@ class ScoreBot(commands.Bot):
     async def prepare_round_repost_image(self, round_row) -> discord.File | None:
         """Build a fresh Discord upload for a round screenshot."""
         round_id = int(round_row["id"])
+        guild_id = int(round_row["guild_id"])
+        round_number = int(round_row["round_number"] or round_id)
 
-        cached = await self.load_round_image_cache(round_id)
+        cached = await self.load_round_image_cache(guild_id, round_number, legacy_round_id=round_id)
         if cached is not None:
             data, filename = cached
             return self.make_discord_file(data, filename)
@@ -790,7 +1023,7 @@ class ScoreBot(commands.Bot):
                 started_at = datetime.fromisoformat(round_row["started_at"])
                 after = started_at - timedelta(minutes=2)
                 before = started_at + timedelta(minutes=15)
-                expected_title = f"🎮 Manche #{round_row['id']}"
+                expected_title = f"🎮 Manche #{round_number}"
                 try:
                     async for message in channel.history(
                         limit=100, after=after, before=before, oldest_first=True
@@ -833,7 +1066,7 @@ class ScoreBot(commands.Bot):
                     content_type = attachment.content_type or ""
                     ext = mimetypes.guess_extension(content_type) or ".png"
                     filename = f"{filename}{ext}"
-                await self.save_round_image_cache(round_id, data, filename)
+                await self.save_round_image_cache(guild_id, round_number, data, filename)
                 return self.make_discord_file(data, filename)
 
         fallback_url = round_row["image_url"]
@@ -848,7 +1081,7 @@ class ScoreBot(commands.Bot):
                                 content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
                                 ext = mimetypes.guess_extension(content_type) or ".png"
                                 filename = f"round_{round_id}{ext}"
-                                await self.save_round_image_cache(round_id, data, filename)
+                                await self.save_round_image_cache(guild_id, round_number, data, filename)
                                 return self.make_discord_file(data, filename)
             except (asyncio.TimeoutError, aiohttp.ClientError):
                 pass
@@ -913,7 +1146,7 @@ class ScoreBot(commands.Bot):
                     if active_round["accelerated_at"] else ""
                 )
                 round_text = (
-                    f"**Manche #{active_round['id']} en cours**\n"
+                    f"**Manche #{active_round['round_number']} en cours**\n"
                     f"Meneur : <@{active_round['master_id']}>\n"
                     f"Fin : {discord_ts(active_round['ends_at'], 'F')} ({discord_ts(active_round['ends_at'], 'R')})"
                     f"{accelerated_text}"
@@ -922,7 +1155,7 @@ class ScoreBot(commands.Bot):
                 )
             else:
                 round_text = (
-                    f"**Manche #{active_round['id']} terminée**\n"
+                    f"**Manche #{active_round['round_number']} terminée**\n"
                     f"Meneur : <@{active_round['master_id']}>\n"
                     "Validation des dernières réponses en cours."
                 )
@@ -943,7 +1176,8 @@ class ScoreBot(commands.Bot):
 
     async def update_scoreboard(self, guild_id: int, create_if_missing: bool = False) -> discord.Message | None:
         state = await db.get_state(guild_id)
-        channel_id = state["scoreboard_channel_id"] or config.game_channel_id
+        guild_cfg = self.guild_configs.get(guild_id)
+        channel_id = state["scoreboard_channel_id"] or (guild_cfg.get("game_channel_id") if guild_cfg else None)
         message_id = state["scoreboard_message_id"]
 
         if not channel_id:
@@ -980,38 +1214,38 @@ class ScoreBot(commands.Bot):
         await db.set_scoreboard_message(guild_id, channel.id, message.id)
         return message
 
-    async def notify_new_leader(self, guild_id: int, user_id: int) -> bool:
-        user = self.get_user(user_id)
-        if user is None:
-            try:
-                user = await self.fetch_user(user_id)
-            except discord.HTTPException:
-                return False
+    def guild_display_name(self, guild_id: int) -> str:
+        guild = self.get_guild(int(guild_id))
+        return guild.name if guild is not None else f"Serveur {guild_id}"
 
+    def guild_dm_header(self, guild_id: int) -> str:
+        return f"🏠 **Serveur : {self.guild_display_name(guild_id)}**\n\n"
+
+    async def notify_new_leader(self, guild_id: int, user_id: int) -> bool:
         channel_label = "le salon du jeu"
-        if config.game_channel_id:
-            channel = self.get_channel(config.game_channel_id)
+        guild_cfg = self.guild_configs.get(guild_id)
+        channel_id = guild_cfg.get("game_channel_id") if guild_cfg else None
+        if channel_id:
+            channel = self.get_channel(int(channel_id))
             if channel is None:
                 try:
-                    channel = await self.fetch_channel(config.game_channel_id)
+                    channel = await self.fetch_channel(int(channel_id))
                 except discord.HTTPException:
                     channel = None
             if isinstance(channel, discord.TextChannel):
                 channel_label = f"#{channel.name}"
 
-        try:
-            await user.send(
-                "🎮 **Tu es le prochain meneur !**\n\n"
-                f"Dans **{channel_label}**, tu peux utiliser :\n"
-                "**`/lancer`** — lancer la prochaine manche avec une image ou une URL, le nom du jeu et les 3 indices.\n"
-                "**`/passe`** — passer la main si tu ne souhaites pas proposer de manche.\n\n"
-                "Une manche dure au maximum 7 jours et passe en mode accéléré pendant 24 h après la première bonne réponse validée."
-            )
-            return True
-        except (discord.Forbidden, discord.HTTPException):
-            return False
+        return await self.send_player_message(
+            guild_id,
+            user_id,
+            "🎮 **Tu es le prochain meneur !**\n\n"
+            f"Dans **{channel_label}**, tu peux utiliser :\n"
+            "**`/lancer`** — lancer la prochaine manche avec une image ou une URL, le nom du jeu et les 3 indices.\n"
+            "**`/passe`** — passer la main si tu ne souhaites pas proposer de manche.\n\n"
+            "Une manche dure au maximum 7 jours et passe en mode accéléré pendant 24 h après la première bonne réponse validée.",
+        )
 
-    async def send_player_message(self, user_id: int, message: str) -> bool:
+    async def send_player_message(self, guild_id: int, user_id: int, message: str) -> bool:
         user = self.get_user(user_id)
         if user is None:
             try:
@@ -1019,7 +1253,7 @@ class ScoreBot(commands.Bot):
             except discord.HTTPException:
                 return False
         try:
-            await user.send(message)
+            await user.send(self.guild_dm_header(guild_id) + message)
             return True
         except (discord.Forbidden, discord.HTTPException):
             return False
@@ -1058,6 +1292,7 @@ class ScoreBot(commands.Bot):
             finalized_users.add(int(attempt["user_id"]))
             position = french_rank(rank)
             await self.send_player_message(
+                round_row["guild_id"],
                 attempt["user_id"],
                 "✅ **Bonne réponse !**\n"
                 f"Bravo, tu as trouvé et tu es **{position}**.\n"
@@ -1084,10 +1319,22 @@ class ScoreBot(commands.Bot):
 
         delivered = False
         if leader:
-            embed = discord.Embed(title=f"Réponse à valider — Manche #{round_row['id']}")
+            embed = discord.Embed(title=f"Réponse à valider — Manche #{round_row['round_number']}")
+            embed.add_field(
+                name="Serveur",
+                value=self.guild_display_name(round_row["guild_id"]),
+                inline=False,
+            )
             embed.add_field(name="Joueur", value=f"{player} (`{player.id}`)", inline=False)
             embed.add_field(name="Réponse", value=answer, inline=False)
-            embed.add_field(name="Tentative", value=f"#{attempt_id}", inline=False)
+            attempt_number = await db.user_attempt_count(round_row["id"], player.id)
+            attempt_limit = round_row["attempt_limit"]
+            attempt_label = (
+                str(attempt_number)
+                if attempt_limit is None
+                else f"{attempt_number}/{attempt_limit}"
+            )
+            embed.add_field(name="Tentative", value=attempt_label, inline=False)
             try:
                 await leader.send(embed=embed, view=ValidationView(attempt_id))
                 delivered = True
@@ -1144,7 +1391,7 @@ class ScoreBot(commands.Bot):
         if interaction.message is not None:
             try:
                 embed = interaction.message.embeds[0].copy() if interaction.message.embeds else discord.Embed(
-                    title=f"Réponse — Manche #{attempt['round_id']}"
+                    title=f"Réponse — Manche #{attempt['round_number']}"
                 )
                 embed.add_field(
                     name="Statut",
@@ -1166,6 +1413,7 @@ class ScoreBot(commands.Bot):
             finalized = await self.finalize_confirmable_results(attempt["round_id"])
             if int(attempt["user_id"]) not in finalized:
                 await self.send_player_message(
+                    attempt["guild_id"],
                     attempt["user_id"],
                     "✅ **Bonne réponse !**\n"
                     "Bravo, tu as trouvé.\n"
@@ -1204,7 +1452,7 @@ class ScoreBot(commands.Bot):
                         "❌ **Mauvaise réponse.**\n"
                         "Tu as utilisé tous tes essais pour cette manche."
                     )
-            await self.send_player_message(attempt["user_id"], message)
+            await self.send_player_message(attempt["guild_id"], attempt["user_id"], message)
             # Une invalidation peut lever l’incertitude sur le rang d’une bonne réponse plus tardive.
             await self.finalize_confirmable_results(attempt["round_id"])
 
@@ -1244,7 +1492,7 @@ class ScoreBot(commands.Bot):
 
         if isinstance(channel, discord.abc.Messageable):
             acceleration_content = (
-                f"## ⚡ Manche #{round_id} - Le jeu s’accélère !\n"
+                f"## ⚡ Manche #{refreshed['round_number']} - Le jeu s’accélère !\n"
                 "Une première bonne réponse a été validée. Son auteur reste secret jusqu’à la fin.\n\n"
                 f"Les autres participants ont désormais jusqu’à <t:{int(effective_end.timestamp())}:F> "
                 f"(<t:{int(effective_end.timestamp())}:R>) pour répondre.\n"
@@ -1292,7 +1540,7 @@ class ScoreBot(commands.Bot):
 
                 remaining_points = {1: "5 / 4 / 3", 2: "4 / 3 / 2", 3: "3 / 2 / 1"}[hint_number]
                 hint_content = (
-                    f"💡 Manche #{round_row['id']} - Indice {hint_number}/3\n\n"
+                    f"💡 Manche #{round_row['round_number']} - Indice {hint_number}/3\n\n"
                     f"**{round_row[f'hint_{hint_number}']}**\n\n"
                     f"*Barème du podium à partir de maintenant : {remaining_points} points • 1 pt à partir de la 4e place*"
                 )
@@ -1336,6 +1584,7 @@ class ScoreBot(commands.Bot):
             # orpheline (y compris celles créées par une ancienne version du bot).
             for attempt in pending:
                 await self.send_player_message(
+                    round_row["guild_id"],
                     attempt["user_id"],
                     "⚠️ **Manche clôturée par un administrateur.**\n"
                     "Ta réponse encore en attente de validation n’a pas été comptabilisée.",
@@ -1352,20 +1601,18 @@ class ScoreBot(commands.Bot):
                     master = None
             delivered = False
             if master:
-                try:
-                    await master.send(
-                        f"⏰ La manche #{round_id} est terminée : les nouvelles réponses sont fermées. "
-                        f"Il reste **{len(pending)} réponse(s)** à valider dans tes messages privés. "
-                        "Le classement sera publié dès que toutes auront été examinées."
-                    )
-                    delivered = True
-                except discord.Forbidden:
-                    pass
+                delivered = await self.send_player_message(
+                    round_row["guild_id"],
+                    round_row["master_id"],
+                    f"⏰ La manche #{round_row['round_number']} est terminée : les nouvelles réponses sont fermées. "
+                    f"Il reste **{len(pending)} réponse(s)** à valider dans tes messages privés. "
+                    "Le classement sera publié dès que toutes auront été examinées.",
+                )
             if not delivered:
                 channel = self.get_channel(round_row["channel_id"])
                 if isinstance(channel, discord.abc.Messageable):
                     await channel.send(
-                        f"<@{round_row['master_id']}> les réponses de la manche #{round_id} sont closes ; "
+                        f"<@{round_row['master_id']}> les réponses de la manche #{round_row['round_number']} sont closes ; "
                         f"{len(pending)} validation(s) restent en attente."
                     )
             return False
@@ -1544,7 +1791,7 @@ class ScoreBot(commands.Bot):
         if isinstance(channel, discord.abc.Messageable):
             result_content = (
                 f"# 🎮 {round_row['solution']}\n"
-                f"## Manche #{round_id} terminée !"
+                f"## Manche #{round_row['round_number']} terminée !"
             )
             if image_file is not None:
                 await channel.send(content=result_content, file=image_file)
@@ -1586,7 +1833,425 @@ bot = ScoreBot()
 
 
 def game_channel_ok(interaction: discord.Interaction) -> bool:
-    return config.game_channel_id is None or interaction.channel_id == config.game_channel_id
+    if interaction.guild_id is None:
+        return False
+    guild_cfg = bot.guild_configs.get(interaction.guild_id)
+    if guild_cfg is None or guild_cfg.get("game_channel_id") is None:
+        return False
+    return interaction.channel_id == int(guild_cfg["game_channel_id"])
+
+def configured_channel_mention(guild_id: int) -> str:
+    guild_cfg = bot.guild_configs.get(guild_id)
+    if not guild_cfg or guild_cfg.get("game_channel_id") is None:
+        return "le salon du jeu"
+    return f"<#{int(guild_cfg['game_channel_id'])}>"
+
+
+def guild_access_label(status: str | None) -> str:
+    return {
+        "pending": "en attente d’autorisation",
+        "approved": "autorisé — configuration requise",
+        "configured": "configuré",
+        "blocked": "bloqué",
+        "inactive": "inactif",
+        "refused": "demande refusée",
+    }.get(status or "", "inconnu")
+
+
+async def require_bot_owner(interaction: discord.Interaction) -> bool:
+    if await bot.is_bot_owner_user(interaction.user.id):
+        return True
+    await interaction.response.send_message(
+        "Commande réservée au propriétaire de Guess the Pix.",
+        ephemeral=True,
+    )
+    return False
+
+
+def parse_guild_id(raw_value: str) -> int | None:
+    value = raw_value.strip()
+    if not value.isdigit():
+        return None
+    guild_id = int(value)
+    return guild_id if guild_id > 0 else None
+
+
+@bot.tree.command(name="configurer", description="Configurer Guess the Pix sur ce serveur")
+@app_commands.describe(
+    salon="Salon dans lequel se déroule le jeu",
+    role_admin="Rôle existant autorisé à administrer Guess the Pix (facultatif)",
+    creer_role_admin="Créer automatiquement le rôle Guess the Pix - admin",
+)
+async def configure_server(
+    interaction: discord.Interaction,
+    salon: discord.TextChannel,
+    role_admin: discord.Role | None = None,
+    creer_role_admin: bool = False,
+):
+    if interaction.guild_id is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Commande disponible uniquement sur un serveur.", ephemeral=True)
+        return
+    if not (interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild):
+        await interaction.response.send_message(
+            "La configuration initiale est réservée aux administrateurs ou aux membres ayant la permission Gérer le serveur.",
+            ephemeral=True,
+        )
+        return
+
+    registration = await db.get_guild_registration(interaction.guild_id)
+    if registration is None:
+        status, created = await db.register_guild_join(
+            interaction.guild_id, interaction.guild.name if interaction.guild else None,
+            interaction.guild.owner_id if interaction.guild else None,
+        )
+        if created and interaction.guild is not None:
+            await bot.notify_access_request(interaction.guild)
+    else:
+        status = str(registration["status"])
+    if status not in {"approved", "configured"}:
+        if status == "pending":
+            message = "⏳ Ce serveur est **en attente d’autorisation** du propriétaire de Guess the Pix."
+        elif status == "blocked":
+            message = "⛔ Ce serveur est **bloqué** et ne peut pas être configuré."
+        elif status == "refused":
+            message = "❌ La demande de ce serveur a été **refusée**. Une nouvelle installation est nécessaire pour reformuler une demande."
+        else:
+            message = "Ce serveur doit être autorisé par le propriétaire de Guess the Pix avant d’être configuré."
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    if salon.guild.id != interaction.guild_id:
+        await interaction.response.send_message("Le salon doit appartenir à ce serveur.", ephemeral=True)
+        return
+    if role_admin is not None and role_admin.guild.id != interaction.guild_id:
+        await interaction.response.send_message("Le rôle doit appartenir à ce serveur.", ephemeral=True)
+        return
+    if role_admin is not None and creer_role_admin:
+        await interaction.response.send_message(
+            "Choisis soit un rôle existant, soit la création automatique du rôle admin, pas les deux.",
+            ephemeral=True,
+        )
+        return
+
+    effective_role = role_admin
+    role_created = False
+    if creer_role_admin:
+        existing_role = discord.utils.get(interaction.guild.roles, name=ADMIN_ROLE_NAME)
+        if existing_role is not None:
+            effective_role = existing_role
+        else:
+            bot_member = interaction.guild.me
+            if bot_member is None or not bot_member.guild_permissions.manage_roles:
+                await interaction.response.send_message(
+                    f"Impossible de créer le rôle **{ADMIN_ROLE_NAME}** : le bot n’a pas la permission Gérer les rôles.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                effective_role = await interaction.guild.create_role(
+                    name=ADMIN_ROLE_NAME,
+                    reason="Rôle administrateur créé par Guess the Pix",
+                )
+                role_created = True
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    f"Impossible de créer le rôle **{ADMIN_ROLE_NAME}** : permission refusée par Discord.",
+                    ephemeral=True,
+                )
+                return
+            except discord.HTTPException as exc:
+                logger.warning("Impossible de créer le rôle admin sur %s: %s", interaction.guild_id, exc)
+                await interaction.response.send_message(
+                    f"Impossible de créer le rôle **{ADMIN_ROLE_NAME}** à cause d’une erreur Discord.",
+                    ephemeral=True,
+                )
+                return
+
+    await db.configure_guild(
+        interaction.guild_id,
+        salon.id,
+        effective_role.id if effective_role else None,
+    )
+    await bot.reload_guild_configs()
+    role_display = effective_role.mention if effective_role else "**aucun rôle dédié**"
+    if role_created:
+        role_display += f" (créé sous le nom **{ADMIN_ROLE_NAME}**)"
+    await interaction.response.send_message(
+        "✅ **Guess the Pix est configuré.**\n"
+        f"Salon du jeu : {salon.mention}\n"
+        f"Rôle admin : {role_display}\n"
+        "Essais : **illimités** par défaut\n"
+        "Périodes : **sans limite** par défaut",
+        ephemeral=True,
+    )
+
+
+config_group = app_commands.Group(name="config", description="Configurer Guess the Pix sur ce serveur")
+
+
+@config_group.command(name="statut", description="Afficher la configuration du serveur")
+async def config_status(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Commande disponible uniquement sur un serveur.", ephemeral=True)
+        return
+    guild_cfg = bot.guild_configs.get(interaction.guild_id)
+    if guild_cfg is None:
+        registration = await db.get_guild_registration(interaction.guild_id)
+        status = str(registration["status"]) if registration else "pending"
+        if status == "approved":
+            text = "✅ Ce serveur est **autorisé**. Un administrateur peut maintenant utiliser `/configurer`."
+        elif status == "blocked":
+            text = "⛔ Ce serveur est **bloqué** par le propriétaire de Guess the Pix."
+        elif status == "inactive":
+            text = "Ce serveur est enregistré comme **inactif**."
+        elif status == "refused":
+            text = "❌ La demande de ce serveur a été **refusée** par le propriétaire de Guess the Pix."
+        else:
+            text = "⏳ Ce serveur est **en attente d’autorisation** du propriétaire de Guess the Pix."
+        await interaction.response.send_message(text, ephemeral=True)
+        return
+    if not is_admin(interaction):
+        await interaction.response.send_message("Commande réservée aux administrateurs du jeu.", ephemeral=True)
+        return
+    state = await db.get_state(interaction.guild_id)
+    period = await db.get_current_period(interaction.guild_id)
+    progress, limit = await db.period_progress(period["id"])
+    role_id = guild_cfg.get("admin_role_id")
+    attempt_limit = state["default_attempt_limit"]
+    await interaction.response.send_message(
+        "⚙️ **Configuration Guess the Pix**\n"
+        f"Salon : <#{int(guild_cfg['game_channel_id'])}>\n"
+        f"Rôle admin : {f'<@&{int(role_id)}>' if role_id else '**aucun rôle dédié**'}\n"
+        f"Essais : **{'illimités' if attempt_limit is None else str(attempt_limit)}**\n"
+        f"Période : **{period['number']}** — "
+        f"{'sans limite' if limit is None else f'{progress}/{limit} manches'}\n"
+        f"Environnement : **{config.environment}**",
+        ephemeral=True,
+    )
+
+
+@config_group.command(name="salon", description="Changer le salon du jeu")
+@app_commands.describe(salon="Nouveau salon du jeu")
+async def config_channel(interaction: discord.Interaction, salon: discord.TextChannel):
+    if interaction.guild_id is None or not is_admin(interaction):
+        await interaction.response.send_message("Commande réservée aux administrateurs du jeu.", ephemeral=True)
+        return
+    if bot.guild_configs.get(interaction.guild_id) is None:
+        await interaction.response.send_message("Utilise d’abord `/configurer`.", ephemeral=True)
+        return
+    await db.set_guild_channel(interaction.guild_id, salon.id)
+    await bot.reload_guild_configs()
+    await interaction.response.send_message(f"Salon du jeu défini sur {salon.mention}.", ephemeral=True)
+
+
+@config_group.command(name="role-admin", description="Changer le rôle administrateur du jeu")
+@app_commands.describe(role="Rôle Game Admin ; laisser vide pour supprimer le rôle dédié")
+async def config_admin_role(interaction: discord.Interaction, role: discord.Role | None = None):
+    if interaction.guild_id is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Commande disponible uniquement sur un serveur.", ephemeral=True)
+        return
+    # Seuls Administrator/Manage Guild peuvent changer le rôle qui accorde les droits du bot.
+    if not (interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild):
+        await interaction.response.send_message(
+            "La modification du rôle admin nécessite la permission Gérer le serveur.", ephemeral=True
+        )
+        return
+    if bot.guild_configs.get(interaction.guild_id) is None:
+        await interaction.response.send_message("Utilise d’abord `/configurer`.", ephemeral=True)
+        return
+    await db.set_guild_admin_role(interaction.guild_id, role.id if role else None)
+    await bot.reload_guild_configs()
+    await interaction.response.send_message(
+        f"Rôle admin défini sur {role.mention}." if role else "Le rôle administrateur dédié a été supprimé.",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(config_group)
+
+
+owner_group = app_commands.Group(
+    name="proprietaire",
+    description="Contrôler les serveurs autorisés à utiliser Guess the Pix",
+)
+
+
+@owner_group.command(name="serveurs", description="Lister les serveurs connus et leur statut")
+async def owner_servers(interaction: discord.Interaction):
+    if not await require_bot_owner(interaction):
+        return
+    rows = await db.list_guild_registrations()
+    if not rows:
+        await interaction.response.send_message("Aucun serveur n’est encore enregistré.", ephemeral=True)
+        return
+    icons = {
+        "pending": "⏳",
+        "approved": "✅",
+        "configured": "🟢",
+        "blocked": "⛔",
+        "inactive": "⚫",
+        "refused": "❌",
+    }
+    lines: list[str] = []
+    for row in rows[:20]:
+        guild_id = int(row["guild_id"])
+        status = str(row["status"])
+        guild = bot.get_guild(guild_id)
+        name = guild.name if guild is not None else (row["guild_name"] or "Serveur inconnu")
+        presence = (
+            "refusé" if status == "refused"
+            else ("présent" if guild is not None else "absent")
+        )
+        lines.append(
+            f"{icons.get(status, '•')} **{name}** — `{guild_id}` — "
+            f"**{guild_access_label(status)}** — {presence}"
+        )
+    if len(rows) > 20:
+        lines.append(f"… et {len(rows) - 20} autre(s) serveur(s).")
+    await interaction.response.send_message(
+        embed=discord.Embed(title="Serveurs Guess the Pix", description="\n".join(lines)),
+        ephemeral=True,
+    )
+
+
+@owner_group.command(name="autoriser", description="Autoriser une demande de serveur")
+@app_commands.describe(serveur_id="ID Discord du serveur à autoriser")
+async def owner_approve(interaction: discord.Interaction, serveur_id: str):
+    if not await require_bot_owner(interaction):
+        return
+    guild_id = parse_guild_id(serveur_id)
+    if guild_id is None:
+        await interaction.response.send_message("ID de serveur invalide.", ephemeral=True)
+        return
+    row = await db.get_guild_registration(guild_id)
+    if row is None:
+        await interaction.response.send_message("Ce serveur n’est pas connu du bot.", ephemeral=True)
+        return
+    status = str(row["status"])
+    if status == "blocked":
+        await interaction.response.send_message(
+            "Ce serveur est bloqué. Utilise d’abord `/proprietaire debloquer`.",
+            ephemeral=True,
+        )
+        return
+    if status == "configured":
+        await interaction.response.send_message("Ce serveur est déjà configuré.", ephemeral=True)
+        return
+    if status == "approved":
+        await interaction.response.send_message("Ce serveur est déjà autorisé et attend sa configuration.", ephemeral=True)
+        return
+    if status != "pending":
+        await interaction.response.send_message(
+            "Ce serveur n’a pas de demande active. Il doit réinstaller le bot pour créer une nouvelle demande.",
+            ephemeral=True,
+        )
+        return
+
+    await db.set_guild_registration_status(guild_id, "approved")
+    guild = bot.get_guild(guild_id)
+    if guild is not None:
+        await bot.send_dm_to_user_id(
+            guild.owner_id,
+            "✅ **Guess the Pix a été autorisé sur votre serveur.**\n"
+            f"Serveur : **{guild.name}**\n\n"
+            "Un administrateur peut maintenant lancer `/configurer` et choisir le salon du jeu.",
+        )
+    await interaction.response.send_message(
+        f"✅ Serveur `{guild_id}` autorisé. Il peut maintenant utiliser `/configurer`.",
+        ephemeral=True,
+    )
+
+
+@owner_group.command(name="refuser", description="Refuser une demande et retirer le bot du serveur")
+@app_commands.describe(serveur_id="ID Discord du serveur à refuser")
+async def owner_reject(interaction: discord.Interaction, serveur_id: str):
+    if not await require_bot_owner(interaction):
+        return
+    guild_id = parse_guild_id(serveur_id)
+    if guild_id is None:
+        await interaction.response.send_message("ID de serveur invalide.", ephemeral=True)
+        return
+    row = await db.get_guild_registration(guild_id)
+    if row is None:
+        await interaction.response.send_message("Ce serveur n’est pas connu du bot.", ephemeral=True)
+        return
+    status = str(row["status"])
+    if status not in {"pending", "approved"}:
+        await interaction.response.send_message(
+            "`/proprietaire refuser` s’applique uniquement à une demande en attente. "
+            "Pour retirer un serveur déjà configuré, utilise `/proprietaire bloquer`.",
+            ephemeral=True,
+        )
+        return
+    guild = bot.get_guild(guild_id)
+    await db.set_guild_registration_status(guild_id, "refused")
+    await bot.reload_guild_configs()
+    await interaction.response.send_message(f"Demande du serveur `{guild_id}` refusée et conservée dans l’historique.", ephemeral=True)
+    if guild is not None:
+        await bot.send_dm_to_user_id(
+            guild.owner_id,
+            "❌ **La demande Guess the Pix de votre serveur a été refusée.**\n"
+            f"Serveur : **{guild.name}**",
+        )
+        try:
+            await guild.leave()
+        except discord.HTTPException:
+            logger.exception("Impossible de quitter le serveur refuse %s", guild_id)
+
+
+@owner_group.command(name="bloquer", description="Bloquer un serveur et retirer le bot")
+@app_commands.describe(serveur_id="ID Discord du serveur à bloquer")
+async def owner_block(interaction: discord.Interaction, serveur_id: str):
+    if not await require_bot_owner(interaction):
+        return
+    guild_id = parse_guild_id(serveur_id)
+    if guild_id is None:
+        await interaction.response.send_message("ID de serveur invalide.", ephemeral=True)
+        return
+    row = await db.get_guild_registration(guild_id)
+    if row is None:
+        await interaction.response.send_message("Ce serveur n’est pas connu du bot.", ephemeral=True)
+        return
+    await db.set_guild_registration_status(guild_id, "blocked")
+    await bot.reload_guild_configs()
+    guild = bot.get_guild(guild_id)
+    await interaction.response.send_message(f"⛔ Serveur `{guild_id}` bloqué.", ephemeral=True)
+    if guild is not None:
+        await bot.send_dm_to_user_id(
+            guild.owner_id,
+            "⛔ **Guess the Pix a été désactivé pour votre serveur.**\n"
+            f"Serveur : **{guild.name}**",
+        )
+        try:
+            await guild.leave()
+        except discord.HTTPException:
+            logger.exception("Impossible de quitter le serveur bloque %s", guild_id)
+
+
+@owner_group.command(name="debloquer", description="Autoriser un serveur bloqué à refaire une demande")
+@app_commands.describe(serveur_id="ID Discord du serveur à débloquer")
+async def owner_unblock(interaction: discord.Interaction, serveur_id: str):
+    if not await require_bot_owner(interaction):
+        return
+    guild_id = parse_guild_id(serveur_id)
+    if guild_id is None:
+        await interaction.response.send_message("ID de serveur invalide.", ephemeral=True)
+        return
+    row = await db.get_guild_registration(guild_id)
+    if row is None:
+        await interaction.response.send_message("Ce serveur n’est pas connu du bot.", ephemeral=True)
+        return
+    if str(row["status"]) != "blocked":
+        await interaction.response.send_message("Ce serveur n’est pas bloqué.", ephemeral=True)
+        return
+    await db.set_guild_registration_status(guild_id, "inactive")
+    await interaction.response.send_message(
+        f"✅ Serveur `{guild_id}` débloqué. Une nouvelle invitation créera une nouvelle demande d’autorisation.",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(owner_group)
 
 
 @bot.tree.command(name="aide", description="Afficher les commandes du jeu")
@@ -1594,25 +2259,74 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(await build_help_text(interaction), ephemeral=True)
 
 
+async def designer_participant_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None or interaction.guild is None:
+        return []
+
+    participant_ids = await db.active_participant_ids(interaction.guild_id)
+    needle = current.casefold().strip()
+    choices: list[app_commands.Choice[str]] = []
+
+    for user_id in participant_ids:
+        member = interaction.guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+
+        display = member.display_name
+        searchable = f"{display} {member.name}".casefold()
+        if needle and needle not in searchable:
+            continue
+
+        label = display if display == member.name else f"{display} ({member.name})"
+        choices.append(app_commands.Choice(name=label[:100], value=str(user_id)))
+        if len(choices) >= 25:
+            break
+
+    return choices
+
+
 @bot.tree.command(name="designer", description="Désigner manuellement le prochain meneur")
-@app_commands.describe(joueur="Le membre à désigner")
-async def designate(interaction: discord.Interaction, joueur: discord.Member):
-    if interaction.guild_id is None or not is_admin(interaction):
+@app_commands.describe(joueur="Participant actif à désigner")
+@app_commands.autocomplete(joueur=designer_participant_autocomplete)
+async def designate(interaction: discord.Interaction, joueur: str):
+    if interaction.guild_id is None or interaction.guild is None or not is_admin(interaction):
         await interaction.response.send_message("Commande réservée au rôle Admin du jeu ou aux administrateurs du serveur.", ephemeral=True)
         return
     if await db.get_active_round(interaction.guild_id):
         await interaction.response.send_message("Impossible de changer de meneur tant que la manche n’est pas totalement clôturée.", ephemeral=True)
         return
-    if not await db.is_participant_active(interaction.guild_id, joueur.id):
-        await interaction.response.send_message("Ce membre n’est pas inscrit au jeu. Il doit d’abord utiliser `/participer`.", ephemeral=True)
+
+    try:
+        joueur_id = int(joueur)
+    except (TypeError, ValueError):
+        await interaction.response.send_message("Participant invalide. Sélectionne un joueur dans la liste proposée.", ephemeral=True)
         return
+
+    if not await db.is_participant_active(interaction.guild_id, joueur_id):
+        await interaction.response.send_message("Ce joueur n’est plus un participant actif.", ephemeral=True)
+        return
+
+    member = interaction.guild.get_member(joueur_id)
+    if member is None:
+        try:
+            member = await interaction.guild.fetch_member(joueur_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message("Impossible de retrouver ce participant sur le serveur.", ephemeral=True)
+            return
+
     state = await db.get_state(interaction.guild_id)
     # Le DM au nouveau meneur peut nécessiter des appels API Discord. On acquitte
     # la commande avant ces opérations pour éviter un timeout côté utilisateur.
     await interaction.response.defer()
-    await db.set_master(interaction.guild_id, joueur.id, previous_master_id=state["current_master_id"])
-    notified = await bot.notify_new_leader(interaction.guild_id, joueur.id)
-    message = f"🎮 {joueur.mention} est le prochain meneur."
+    await db.set_master(interaction.guild_id, joueur_id, previous_master_id=state["current_master_id"])
+    notified = await bot.notify_new_leader(interaction.guild_id, joueur_id)
+    message = f"🎮 {member.mention} est le prochain meneur."
     if not notified:
         message += "\n⚠️ Impossible de lui envoyer les instructions en message privé."
     await interaction.followup.send(message)
@@ -2085,7 +2799,7 @@ async def history(interaction: discord.Interaction):
         await interaction.response.send_message("Aucune manche terminée.")
         return
     lines = [
-        f"**#{row['id']}** — {row['solution']} — meneur <@{row['master_id']}>"
+        f"**#{row['round_number']}** — {row['solution']} — meneur <@{row['master_id']}>"
         for row in rows
     ]
     await interaction.response.send_message(embed=discord.Embed(title="Historique", description="\n".join(lines)))

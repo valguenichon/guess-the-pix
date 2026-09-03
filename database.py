@@ -32,6 +32,31 @@ class Database:
         async with self.connection() as db:
             await db.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS guild_config (
+                    guild_id INTEGER PRIMARY KEY,
+                    game_channel_id INTEGER,
+                    admin_role_id INTEGER,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS guild_registry (
+                    guild_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    guild_name TEXT,
+                    guild_owner_id INTEGER,
+                    joined_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS guild_features (
+                    guild_id INTEGER NOT NULL,
+                    feature TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (guild_id, feature)
+                );
+
                 CREATE TABLE IF NOT EXISTS guild_state (
                     guild_id INTEGER PRIMARY KEY,
                     current_master_id INTEGER,
@@ -64,6 +89,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS rounds (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id INTEGER NOT NULL,
+                    round_number INTEGER,
                     channel_id INTEGER NOT NULL,
                     master_id INTEGER NOT NULL,
                     period_id INTEGER,
@@ -153,9 +179,39 @@ class Database:
                 ("period_id", "INTEGER"),
                 ("attempt_limit", "INTEGER"),
                 ("round_message_id", "INTEGER"),
+                ("round_number", "INTEGER"),
             ):
                 if column not in round_columns:
                     await db.execute(f"ALTER TABLE rounds ADD COLUMN {column} {definition}")
+
+            # Numérotation visible indépendante pour chaque serveur. L'ID SQLite
+            # reste technique et peut continuer à être global.
+            guild_rounds = await (await db.execute(
+                "SELECT DISTINCT guild_id FROM rounds ORDER BY guild_id"
+            )).fetchall()
+            for guild_row in guild_rounds:
+                guild_id = int(guild_row["guild_id"])
+                rows = await (await db.execute(
+                    "SELECT id, round_number FROM rounds WHERE guild_id = ? ORDER BY id",
+                    (guild_id,),
+                )).fetchall()
+                used = {int(row["round_number"]) for row in rows if row["round_number"] is not None}
+                next_number = 1
+                for row in rows:
+                    if row["round_number"] is not None:
+                        next_number = max(next_number, int(row["round_number"]) + 1)
+                        continue
+                    while next_number in used:
+                        next_number += 1
+                    await db.execute(
+                        "UPDATE rounds SET round_number = ? WHERE id = ?",
+                        (next_number, int(row["id"])),
+                    )
+                    used.add(next_number)
+                    next_number += 1
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_rounds_guild_number ON rounds(guild_id, round_number)"
+            )
 
             attempt_columns = {row["name"] for row in await (await db.execute("PRAGMA table_info(attempts)")).fetchall()}
             for column, definition in (
@@ -247,6 +303,196 @@ class Database:
                     (original_ends_at, hint_1_at, hint_2_at, hint_3_at, row["id"]),
                 )
 
+            # Les serveurs déjà configurés avant l'introduction du workflow
+            # d'autorisation restent immédiatement utilisables.
+            configured_rows = await (await db.execute(
+                "SELECT guild_id FROM guild_config WHERE enabled = 1"
+            )).fetchall()
+            for configured_row in configured_rows:
+                guild_id = int(configured_row["guild_id"])
+                await db.execute(
+                    """
+                    INSERT INTO guild_registry(guild_id, status, updated_at)
+                    VALUES (?, 'configured', ?)
+                    ON CONFLICT(guild_id) DO NOTHING
+                    """,
+                    (guild_id, utcnow_iso()),
+                )
+
+            await db.commit()
+
+    async def get_guild_registration(self, guild_id: int):
+        async with self.connection() as db:
+            return await (await db.execute(
+                "SELECT * FROM guild_registry WHERE guild_id = ?",
+                (guild_id,),
+            )).fetchone()
+
+    async def list_guild_registrations(self):
+        async with self.connection() as db:
+            return await (await db.execute(
+                "SELECT * FROM guild_registry ORDER BY updated_at DESC, guild_id"
+            )).fetchall()
+
+    async def register_guild_join(
+        self, guild_id: int, guild_name: str | None, guild_owner_id: int | None
+    ) -> tuple[str, bool]:
+        """Enregistre une arrivée et renvoie (statut, nouvelle_demande).
+
+        Un serveur bloqué reste bloqué. Un serveur précédemment inactif ou refusé
+        doit refaire une demande. Les serveurs déjà approved/configured sont
+        conservés, ce qui rend les reconnexions transitoires inoffensives.
+        """
+        now = utcnow_iso()
+        async with self.connection() as db:
+            row = await (await db.execute(
+                "SELECT status FROM guild_registry WHERE guild_id = ?",
+                (guild_id,),
+            )).fetchone()
+            if row is None:
+                await db.execute(
+                    """
+                    INSERT INTO guild_registry(
+                        guild_id, status, guild_name, guild_owner_id, joined_at, updated_at
+                    ) VALUES (?, 'pending', ?, ?, ?, ?)
+                    """,
+                    (guild_id, guild_name, guild_owner_id, now, now),
+                )
+                await db.commit()
+                return "pending", True
+
+            status = str(row["status"])
+            new_request = status in {"inactive", "refused"}
+            next_status = "pending" if new_request else status
+            await db.execute(
+                """
+                UPDATE guild_registry
+                SET status = ?, guild_name = ?, guild_owner_id = ?,
+                    joined_at = COALESCE(joined_at, ?), updated_at = ?
+                WHERE guild_id = ?
+                """,
+                (next_status, guild_name, guild_owner_id, now, now, guild_id),
+            )
+            await db.commit()
+            return next_status, new_request
+
+    async def set_guild_registration_status(self, guild_id: int, status: str) -> bool:
+        if status not in {"pending", "approved", "configured", "blocked", "inactive", "refused"}:
+            raise ValueError("Statut de serveur invalide.")
+        async with self.connection() as db:
+            cursor = await db.execute(
+                "UPDATE guild_registry SET status = ?, updated_at = ? WHERE guild_id = ?",
+                (status, utcnow_iso(), guild_id),
+            )
+            if status in {"pending", "approved", "blocked", "inactive", "refused"}:
+                await db.execute(
+                    "UPDATE guild_config SET enabled = 0, updated_at = ? WHERE guild_id = ?",
+                    (utcnow_iso(), guild_id),
+                )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def mark_guild_inactive(self, guild_id: int) -> None:
+        async with self.connection() as db:
+            row = await (await db.execute(
+                "SELECT status FROM guild_registry WHERE guild_id = ?",
+                (guild_id,),
+            )).fetchone()
+            if row is None or row["status"] in {"blocked", "refused"}:
+                return
+            now = utcnow_iso()
+            await db.execute(
+                "UPDATE guild_registry SET status = 'inactive', updated_at = ? WHERE guild_id = ?",
+                (now, guild_id),
+            )
+            await db.execute(
+                "UPDATE guild_config SET enabled = 0, updated_at = ? WHERE guild_id = ?",
+                (now, guild_id),
+            )
+            await db.commit()
+
+    async def get_guild_config(self, guild_id: int):
+        async with self.connection() as db:
+            return await (await db.execute(
+                "SELECT * FROM guild_config WHERE guild_id = ? AND enabled = 1",
+                (guild_id,),
+            )).fetchone()
+
+    async def list_guild_configs(self):
+        async with self.connection() as db:
+            return await (await db.execute(
+                "SELECT * FROM guild_config WHERE enabled = 1 ORDER BY guild_id"
+            )).fetchall()
+
+    async def configure_guild(
+        self, guild_id: int, game_channel_id: int, admin_role_id: int | None = None
+    ) -> None:
+        now = utcnow_iso()
+        async with self.connection() as db:
+            await db.execute(
+                """
+                INSERT INTO guild_config(
+                    guild_id, game_channel_id, admin_role_id, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    game_channel_id = excluded.game_channel_id,
+                    admin_role_id = excluded.admin_role_id,
+                    enabled = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, game_channel_id, admin_role_id, now, now),
+            )
+            await db.execute("INSERT OR IGNORE INTO guild_state(guild_id) VALUES (?)", (guild_id,))
+            await db.execute(
+                """
+                INSERT INTO guild_registry(guild_id, status, updated_at)
+                VALUES (?, 'configured', ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    status = 'configured',
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, now),
+            )
+            await db.commit()
+        await self.ensure_current_period(guild_id)
+
+    async def set_guild_channel(self, guild_id: int, game_channel_id: int) -> None:
+        current = await self.get_guild_config(guild_id)
+        await self.configure_guild(
+            guild_id, game_channel_id, current["admin_role_id"] if current else None
+        )
+
+    async def set_guild_admin_role(self, guild_id: int, admin_role_id: int | None) -> None:
+        current = await self.get_guild_config(guild_id)
+        if current is None or current["game_channel_id"] is None:
+            raise ValueError("Le serveur doit d'abord être configuré.")
+        await self.configure_guild(guild_id, int(current["game_channel_id"]), admin_role_id)
+
+    async def migrate_legacy_config(
+        self, guild_id: int | None, game_channel_id: int | None, admin_role_id: int | None
+    ) -> bool:
+        if guild_id is None or game_channel_id is None:
+            return False
+        if await self.get_guild_config(guild_id) is not None:
+            return False
+        await self.configure_guild(guild_id, game_channel_id, admin_role_id)
+        return True
+
+    async def feature_enabled(self, guild_id: int, feature: str) -> bool:
+        async with self.connection() as db:
+            row = await (await db.execute(
+                "SELECT enabled FROM guild_features WHERE guild_id = ? AND feature = ?",
+                (guild_id, feature),
+            )).fetchone()
+            return bool(row and row["enabled"])
+
+    async def set_feature(self, guild_id: int, feature: str, enabled: bool) -> None:
+        async with self.connection() as db:
+            await db.execute(
+                """INSERT INTO guild_features(guild_id, feature, enabled) VALUES (?, ?, ?)
+                   ON CONFLICT(guild_id, feature) DO UPDATE SET enabled = excluded.enabled""",
+                (guild_id, feature, 1 if enabled else 0),
+            )
             await db.commit()
 
     async def ensure_guild(self, guild_id: int) -> None:
@@ -614,17 +860,23 @@ class Database:
         hint_3_scheduled_at: str,
     ) -> int:
         async with self.connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            number_row = await (await db.execute(
+                "SELECT COALESCE(MAX(round_number), 0) + 1 AS n FROM rounds WHERE guild_id = ?",
+                (guild_id,),
+            )).fetchone()
+            round_number = int(number_row["n"])
             cursor = await db.execute(
                 """
                 INSERT INTO rounds(
-                    guild_id, channel_id, master_id, period_id, attempt_limit, solution, image_url,
+                    guild_id, round_number, channel_id, master_id, period_id, attempt_limit, solution, image_url,
                     hint_1, hint_2, hint_3,
                     hint_1_scheduled_at, hint_2_scheduled_at, hint_3_scheduled_at,
                     started_at, ends_at, original_ends_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
                 """,
                 (
-                    guild_id, channel_id, master_id, period_id, attempt_limit, solution, image_url,
+                    guild_id, round_number, channel_id, master_id, period_id, attempt_limit, solution, image_url,
                     hint_1, hint_2, hint_3,
                     hint_1_scheduled_at, hint_2_scheduled_at, hint_3_scheduled_at,
                     started_at, ends_at, ends_at,
@@ -817,7 +1069,7 @@ class Database:
         async with self.connection() as db:
             return await (await db.execute(
                 """
-                SELECT a.*, r.master_id, r.status AS round_status, r.attempt_limit, r.period_id
+                SELECT a.*, r.master_id, r.status AS round_status, r.attempt_limit, r.period_id, r.round_number
                 FROM attempts a
                 JOIN rounds r ON r.id = a.round_id
                 WHERE a.id = ?

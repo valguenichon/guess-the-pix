@@ -1,12 +1,15 @@
+name: ${COMPOSE_PROJECT_NAME:-guess-the-pix}
+
 services:
-  discord-scoreboard:
+  guess-the-pix:
     build: .
-    container_name: discord-scoreboard
+    image: guess-the-pix:1.0.0
+    container_name: ${CONTAINER_NAME:-guess-the-pix}
     restart: unless-stopped
     env_file:
-      - /volume1/docker/discord-scoreboard/.env
+      - .env
     volumes:
-      - /volume1/docker/discord-scoreboard/data:/app/data
-      - /volume1/docker/discord-scoreboard/bot.py:/app/bot.py:ro
-      - /volume1/docker/discord-scoreboard/config.py:/app/config.py:ro
-      - /volume1/docker/discord-scoreboard/database.py:/app/database.py:ro
+      - ./data:/app/data
+      - ./bot.py:/app/bot.py:ro
+      - ./config.py:/app/config.py:ro
+      - ./database.py:/app/database.py:ro

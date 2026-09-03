@@ -1,66 +1,148 @@
-# Guess the Pix — Discord bot v0.13.2
+# Guess the Pix v1.0.0
 
-Bot Discord mono-serveur pour un jeu de découverte de jeux vidéo à partir de captures d’écran.
+Première version stable multi-serveurs de Guess the Pix.
 
-## Principales règles
+## Autorisation des serveurs
 
-- Les joueurs s’inscrivent avec `/participer`.
-- Le meneur lance une manche avec `/lancer` et fournit une capture, la réponse et 3 indices.
-- Une manche dure 7 jours maximum.
-- Les indices sont initialement prévus à J+2, J+4 et J+6.
-- La première bonne réponse validée déclenche le mode accéléré : 24 h maximum restantes, sans dépasser la fin initiale.
-- Les réponses sont privées et arbitrées par le meneur.
-- Le verdict est communiqué immédiatement au joueur après validation.
-- Le podium rapporte 6/5/4, puis 5/4/3, 4/3/2 et 3/2/1 selon les indices révélés.
-- **À partir de la 4e place, toute bonne réponse rapporte 1 point.**
-- Si personne ne trouve, le meneur gagne 4 points.
-- Le classement est organisé par périodes et le nombre d’essais peut être illimité ou limité par l’administration.
+La v1 contrôle désormais les nouvelles installations avant toute configuration :
 
-## Nouveautés v0.13.x
+1. le bot rejoint un nouveau serveur : statut `pending` ;
+2. le propriétaire du bot reçoit une notification privée ;
+3. `/configurer` reste bloqué tant que la demande n'est pas autorisée ;
+4. `/proprietaire autoriser serveur_id:...` passe le serveur à `approved` ;
+5. un administrateur du serveur exécute `/configurer` ;
+6. le serveur passe alors à `configured`.
 
-### 1 point à partir de la 4e place
+Commandes réservées au propriétaire du bot :
 
-Le podium conserve son barème progressif en fonction des indices. Tous les joueurs classés à partir de la 4e position reçoivent 1 point lorsqu’ils trouvent le jeu.
+- `/proprietaire serveurs` : liste les serveurs connus et leur statut ;
+- `/proprietaire autoriser` : autorise une demande en attente ;
+- `/proprietaire refuser` : refuse la demande et retire le bot ;
+- `/proprietaire bloquer` : bloque le serveur et retire le bot ;
+- `/proprietaire debloquer` : permet au serveur de refaire une demande lors d'une future invitation.
 
+États enregistrés : `pending`, `approved`, `configured`, `refused`, `blocked`, `inactive`.
+Un serveur retirant le bot devient `inactive` ; une demande explicitement refusée reste `refused` dans l’historique. Une nouvelle invitation d’un serveur `inactive` ou `refused` crée une nouvelle demande ; si le serveur avait déjà été refusé, le propriétaire du bot en est explicitement averti.
+Les serveurs déjà configurés avant cette évolution sont automatiquement conservés en `configured`.
 
-### Fiabilité des interactions — v0.13.2
+`BOT_OWNER_USER_ID` peut être renseigné dans `.env`. S'il est absent, le bot tente de déterminer automatiquement le propriétaire de l'application Discord.
 
-Les interactions susceptibles d’effectuer des opérations plus lentes sont maintenant acquittées immédiatement auprès de Discord. Cela concerne `/passe`, `/designer`, la validation du formulaire `/lancer`, `/periodes` et la confirmation de `/reinitialiser`.
+## Architecture
 
-`/passe` utilise en plus un changement de meneur atomique afin d’éviter un double tirage si deux interactions arrivent presque simultanément. Le nouveau meneur tiré au sort est annoncé publiquement dans le salon et reçoit toujours ses instructions en message privé.
+Une instance peut servir plusieurs serveurs Discord. Chaque serveur dispose de sa propre configuration et de ses propres données : salon de jeu, rôle administrateur, participants, meneur, manches, périodes, scores, historique, limite d'essais et scoreboard.
 
-`/periodes` calcule désormais la progression de toutes les périodes avec une seule requête agrégée.
+Tous les messages privés liés à une partie indiquent explicitement le **nom du serveur d’origine**, afin qu’un même utilisateur puisse participer ou être meneur sur plusieurs serveurs sans ambiguïté.
 
-### Captures dans les messages de manche — v0.13.1
-
-Les messages différés ne dépendent plus d’une URL CDN Discord pour afficher la capture. Avant de publier un indice, le mode accéléré ou le résultat final, le bot récupère la pièce jointe du message initial puis **réuploade réellement l’image dans le nouveau message**. L’embed référence cette nouvelle pièce jointe avec `attachment://...`.
-
-Le mécanisme est identique pour une capture envoyée directement et pour une image fournie initialement par URL. Pour les manches existantes, le bot peut retrouver le message de lancement dans l’historique du salon lorsque sa référence n’est pas disponible.
-
-## Aide et paramètres
-
-`/aide` affiche les paramètres réellement appliqués : limite d’essais de la manche en cours (ou valeur par défaut), période active et progression, durée maximale de 7 jours, accélération à 24 h et nouveau barème à 1 point à partir de la 4e place.
-
-La version du bot est indiquée discrètement en bas de l’aide.
-
-## Mise à jour
-
-### Depuis v0.13.1
-
-1. Remplacer `bot.py` **et** `database.py`.
-2. Redémarrer le conteneur.
-3. Vérifier dans les logs :
+Les captures de manches sont isolées sous :
 
 ```text
-Scoreboard bot version 0.13.2-interaction-timeouts
+data/round_images/<guild_id>/round_<number>.<ext>
 ```
 
-Aucune migration du schéma SQLite et aucune modification de `.env` ne sont nécessaires. `database.py` doit tout de même être remplacé car cette version ajoute les opérations atomiques et la requête optimisée utilisées par le bot.
+## Staging recommandé
 
-### Depuis v0.12.1 ou une version antérieure
+Utiliser une seconde application Discord et un répertoire Synology séparé, par exemple :
 
-Remplacer `bot.py` **et** `database.py`, puis redémarrer le conteneur. Les migrations SQLite introduites par les versions intermédiaires seront appliquées automatiquement.
+```text
+/volume1/docker/guess-the-pix-staging/
+/volume1/docker/guess-the-pix-prod/
+```
 
-## Synology
+Chaque environnement doit posséder son propre `.env` et son propre dossier `data/`.
 
-Avec les bind mounts déjà utilisés sur le NAS, aucune reconstruction de l’image n’est nécessaire : remplacez les fichiers Python puis redémarrez simplement le conteneur.
+Exemple `.env` de staging :
+
+```env
+DISCORD_TOKEN=<token de l'application Discord staging>
+DATABASE_PATH=data/scoreboard.db
+ENVIRONMENT=staging
+COMMAND_GUILD_IDS=
+ROUND_DURATION_DAYS=7
+```
+
+En staging/development, `COMMAND_GUILD_IDS` est désormais **facultatif** : tout serveur effectivement rejoint reçoit automatiquement ses commandes guild-specific, au démarrage comme lors d’une nouvelle invitation. La variable peut encore contenir des IDs séparés par des virgules uniquement pour pré-synchroniser des serveurs connus. En production, elle est ignorée et les commandes sont enregistrées globalement. L’ancienne variable `COMMAND_GUILD_ID` reste acceptée comme pré-synchronisation de compatibilité avec les anciennes configurations de staging.
+
+## Installation du serveur de test
+
+Après ajout du bot sur un nouveau serveur, celui-ci est d'abord placé en `pending`. Le propriétaire du bot autorise la demande avec :
+
+```text
+/proprietaire autoriser serveur_id:<ID_DU_SERVEUR>
+```
+
+Ensuite seulement, un membre du serveur ayant `Administrator` ou `Manage Guild` exécute :
+
+```text
+/configurer salon:#votre-salon role_admin:@Game Admin
+```
+
+Le rôle admin est facultatif. L’administrateur peut soit sélectionner un rôle existant avec `role_admin`, soit demander au bot de créer son rôle dédié :
+
+```text
+/configurer salon:#votre-salon creer_role_admin:Oui
+```
+
+Tout rôle créé automatiquement porte toujours exactement le nom **`Guess the Pix - admin`**. Un rôle existant choisi manuellement conserve son nom. Les deux options ne peuvent pas être utilisées simultanément. Tant que le serveur n'est pas `configured`, les commandes de jeu sont bloquées ; `/aide`, `/config`, `/configurer` et `/proprietaire` restent disponibles.
+
+Commandes de configuration :
+
+```text
+/config statut
+/config salon
+/config role-admin
+```
+
+## Migration depuis v0.13.3
+
+Pour migrer une installation v0.13.3, conserver temporairement dans `.env` les anciennes valeurs :
+
+```env
+GUILD_ID=...
+GAME_CHANNEL_ID=...
+GAME_ADMIN_ROLE_ID=...
+```
+
+Au premier démarrage, elles servent uniquement à créer la configuration du serveur historique. Les données existantes sont conservées.
+
+Après vérification avec `/config statut`, ces trois variables legacy pourront être retirées d'un prochain déploiement.
+
+Toujours sauvegarder `data/scoreboard.db` avant une migration de production.
+
+## Commandes de jeu
+
+Les commandes existantes restent disponibles : `/participer`, `/quitter`, `/participants`, `/reponse`, `/meneur`, `/lancer`, `/passe`, `/score`, `/score-global`, `/periodes`, `/historique`, ainsi que les commandes d'administration.
+
+`/lancer` accepte soit :
+
+- `capture` : une image Discord ;
+- `url` : une URL publique d'image.
+
+Le nom du jeu et les trois indices sont ensuite demandés dans le formulaire.
+
+## Docker / Synology
+
+Le `compose.yaml` fourni utilise `guess-the-pix` comme nom par défaut pour le projet Compose, le service et le conteneur. L’image Docker est explicitement fixée dans le Compose à `guess-the-pix:1.0.0` afin que son nom ne dépende pas du nom du projet Compose.
+
+Les valeurs par défaut sont :
+
+```text
+Projet Compose : guess-the-pix
+Service         : guess-the-pix
+Conteneur       : guess-the-pix
+Image           : guess-the-pix:1.0.0
+```
+
+Le `compose.yaml` utilise également des chemins relatifs afin que le même paquet puisse être placé dans deux répertoires indépendants. Si production et staging tournent simultanément sur le même hôte Docker, le staging doit surcharger le nom du projet et du conteneur dans son `.env` :
+
+```env
+COMPOSE_PROJECT_NAME=guess-the-pix-staging
+CONTAINER_NAME=guess-the-pix-staging
+```
+
+L’image reste `guess-the-pix:1.0.0` car son nom est volontairement fixé dans `compose.yaml`.
+
+Pour une nouvelle instance staging, un build initial est nécessaire. Ensuite, comme `bot.py`, `config.py` et `database.py` sont montés directement, les mises à jour de ces fichiers ne nécessitent normalement qu'un redémarrage du conteneur tant que les dépendances ne changent pas.
+
+## Tests fournis
+
+`tests/test_multiguild.py` vérifie l'isolation de deux guildes dans une base commune. `tests/test_guild_authorization.py` vérifie le cycle pending/approved/configured/inactive/blocked/refused. `tests/test_migration_v0133.py` vérifie la conservation d'une base v0.13.3 représentative et l'idempotence de la migration.
