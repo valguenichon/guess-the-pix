@@ -1,4 +1,4 @@
-# Guess the Pix v1.0.0
+# Guess the Pix v1.0.1
 
 Première version stable multi-serveurs de Guess the Pix.
 
@@ -20,6 +20,7 @@ Commandes réservées au propriétaire du bot :
 - `/proprietaire refuser` : refuse la demande et retire le bot ;
 - `/proprietaire bloquer` : bloque le serveur et retire le bot ;
 - `/proprietaire debloquer` : permet au serveur de refaire une demande lors d'une future invitation.
+- `/proprietaire nettoyer-commandes serveur_id:...` : supprime les anciennes commandes guild-specific héritées d'une version v0.x, sans toucher aux commandes globales ni aux données du jeu.
 
 États enregistrés : `pending`, `approved`, `configured`, `refused`, `blocked`, `inactive`.
 Un serveur retirant le bot devient `inactive` ; une demande explicitement refusée reste `refused` dans l’historique. Une nouvelle invitation d’un serveur `inactive` ou `refused` crée une nouvelle demande ; si le serveur avait déjà été refusé, le propriétaire du bot en est explicitement averti.
@@ -106,6 +107,14 @@ Au premier démarrage, elles servent uniquement à créer la configuration du se
 
 Après vérification avec `/config statut`, ces trois variables legacy pourront être retirées d'un prochain déploiement.
 
+Si Discord affiche encore certaines commandes en double sur le serveur historique après la migration, exécuter :
+
+```text
+/proprietaire nettoyer-commandes serveur_id:<ID_DU_SERVEUR>
+```
+
+Cette opération supprime uniquement les anciennes commandes locales (guild-specific) de l'application. Les commandes globales v1 et toutes les données SQLite restent intactes.
+
 Toujours sauvegarder `data/scoreboard.db` avant une migration de production.
 
 ## Commandes de jeu
@@ -121,7 +130,7 @@ Le nom du jeu et les trois indices sont ensuite demandés dans le formulaire.
 
 ## Docker / Synology
 
-Le `compose.yaml` fourni utilise `guess-the-pix` comme nom par défaut pour le projet Compose, le service et le conteneur. L’image Docker est explicitement fixée dans le Compose à `guess-the-pix:1.0.0` afin que son nom ne dépende pas du nom du projet Compose.
+Le `compose.yaml` fourni utilise `guess-the-pix` comme nom par défaut pour le projet Compose, le service et le conteneur. L’image Docker est explicitement fixée dans le Compose à `guess-the-pix:1.0.1` afin que son nom ne dépende pas du nom du projet Compose.
 
 Les valeurs par défaut sont :
 
@@ -129,7 +138,7 @@ Les valeurs par défaut sont :
 Projet Compose : guess-the-pix
 Service         : guess-the-pix
 Conteneur       : guess-the-pix
-Image           : guess-the-pix:1.0.0
+Image           : guess-the-pix:1.0.1
 ```
 
 Le `compose.yaml` utilise également des chemins relatifs afin que le même paquet puisse être placé dans deux répertoires indépendants. Si production et staging tournent simultanément sur le même hôte Docker, le staging doit surcharger le nom du projet et du conteneur dans son `.env` :
@@ -139,7 +148,7 @@ COMPOSE_PROJECT_NAME=guess-the-pix-staging
 CONTAINER_NAME=guess-the-pix-staging
 ```
 
-L’image reste `guess-the-pix:1.0.0` car son nom est volontairement fixé dans `compose.yaml`.
+L’image reste `guess-the-pix:1.0.1` car son nom est volontairement fixé dans `compose.yaml`.
 
 Pour une nouvelle instance staging, un build initial est nécessaire. Ensuite, comme `bot.py`, `config.py` et `database.py` sont montés directement, les mises à jour de ces fichiers ne nécessitent normalement qu'un redémarrage du conteneur tant que les dépendances ne changent pas.
 

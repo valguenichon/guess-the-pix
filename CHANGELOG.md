@@ -1,3 +1,14 @@
+# Changelog — v1.0.1
+
+## Command cleanup after v0.x migration
+
+- Added owner-only `/proprietaire nettoyer-commandes serveur_id:...`.
+- The command deletes only legacy guild-specific Discord application commands for the selected server.
+- Global v1 commands remain registered and game data/configuration are untouched.
+- Updated the pinned Docker image tag to `guess-the-pix:1.0.1`.
+
+---
+
 # Changelog — v1.0.0
 
 ## Multi-server architecture

@@ -16,7 +16,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "1.0.0"
+BOT_VERSION = "1.0.1"
 ADMIN_ROLE_NAME = "Guess the Pix - admin"
 logger = logging.getLogger("scoreboard")
 
@@ -2248,6 +2248,50 @@ async def owner_unblock(interaction: discord.Interaction, serveur_id: str):
     await interaction.response.send_message(
         f"✅ Serveur `{guild_id}` débloqué. Une nouvelle invitation créera une nouvelle demande d’autorisation.",
         ephemeral=True,
+    )
+
+
+@owner_group.command(
+    name="nettoyer-commandes",
+    description="Supprimer les anciennes commandes locales d’un serveur après migration",
+)
+@app_commands.describe(serveur_id="ID Discord du serveur dont les commandes locales doivent être supprimées")
+async def owner_cleanup_commands(interaction: discord.Interaction, serveur_id: str):
+    if not await require_bot_owner(interaction):
+        return
+
+    guild_id = parse_guild_id(serveur_id)
+    if guild_id is None:
+        await interaction.response.send_message("ID de serveur invalide.", ephemeral=True)
+        return
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        await interaction.response.send_message(
+            "Le bot n’est pas présent sur ce serveur. Aucune commande locale ne peut être nettoyée.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild_object = discord.Object(id=guild_id)
+    bot.tree.clear_commands(guild=guild_object)
+    try:
+        await bot.tree.sync(guild=guild_object)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+        logger.exception("Impossible de nettoyer les commandes locales du serveur %s", guild_id)
+        await interaction.edit_original_response(
+            content=f"❌ Impossible de nettoyer les commandes locales du serveur `{guild_id}` : {exc}"
+        )
+        return
+
+    bot.guild_command_mentions.pop(guild_id, None)
+    await interaction.edit_original_response(
+        content=(
+            f"✅ Commandes locales supprimées pour **{guild.name}** (`{guild_id}`).\n"
+            "Les commandes globales de Guess the Pix restent disponibles. "
+            "Discord peut mettre quelques instants à actualiser la liste affichée."
+        )
     )
 
 
