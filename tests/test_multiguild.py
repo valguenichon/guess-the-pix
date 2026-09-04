@@ -33,6 +33,19 @@ async def main():
         await db.add_score(200, 22, 5, 'test', r200, p200['id'])
         assert (await db.leaderboard(100))[0]['user_id'] == 11
         assert (await db.leaderboard(200))[0]['user_id'] == 22
+
+        accelerated_at = (now + timedelta(hours=1)).isoformat()
+        accelerated_end = (now + timedelta(hours=25)).isoformat()
+        changed = await db.accelerate_round(
+            r100, accelerated_at, accelerated_end,
+            (now + timedelta(hours=7)).isoformat(),
+            (now + timedelta(hours=13)).isoformat(),
+            (now + timedelta(hours=19)).isoformat(),
+        )
+        assert changed is True
+        assert (await db.get_round(r100))['accelerated_at'] == accelerated_at
+        assert (await db.get_round(r200))['accelerated_at'] is None
+
         await db.reset_guild(100)
         assert await db.get_active_round(100) is None
         assert (await db.active_participant_ids(100)) == []
