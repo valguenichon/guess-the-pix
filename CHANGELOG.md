@@ -23,6 +23,18 @@
 - End-of-period embeds retry as plain text if Discord rejects the embed.
 - Announcement failures are logged and no longer abort the remaining round-finalization workflow.
 
+## Game-channel permission monitoring
+
+- Added explicit checks for `View Channel`, `Send Messages`, `Attach Files`, and `Embed Links`.
+- `/configurer` and `/config salon` now reject channels where the bot cannot view or send messages.
+- Missing media/embed permissions are reported as degraded operation instead of being mistaken for generic delivery failures.
+- `/lancer` refuses to create a round when the screenshot cannot be posted because `Attach Files` is missing.
+- Configured channel permissions are checked at startup and when channel or bot-role permissions change.
+- Discord `Forbidden` responses trigger permission diagnostics and administrator alerts.
+- Permission alerts are sent by DM to the server owner, bot owner, and cached game/server administrators.
+- `/config statut` now displays the current permission state of the configured game channel.
+- Repeated announcement fallbacks are skipped when `Send Messages` is unavailable.
+
 - Updated the pinned Docker image tag to `guess-the-pix:1.0.2`.
 
 ---

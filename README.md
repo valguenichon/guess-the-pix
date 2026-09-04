@@ -6,6 +6,18 @@ Première version stable multi-serveurs de Guess the Pix.
 
 Les annonces d'accélération et d'indices utilisent un repli automatique si Discord refuse la capture : nouvel essai sans image, puis texte seul si nécessaire. Les annonces de fin de manche et de fin de période disposent également d'un mode de repli et leurs erreurs n'interrompent plus la finalisation, les scores ni le passage à la période suivante. La publication des indices est sérialisée pour éviter un doublon si le scheduler et une accélération se déclenchent simultanément.
 
+## Contrôle des permissions du salon en v1.0.2
+
+Guess the Pix contrôle désormais les permissions du salon configuré : **Voir le salon**, **Envoyer des messages**, **Joindre des fichiers** et **Intégrer des liens**.
+
+- `/configurer` et `/config salon` refusent un salon dans lequel le bot ne peut pas voir ou envoyer de messages.
+- L'absence de `Joindre des fichiers` ou `Intégrer des liens` est signalée comme fonctionnement dégradé ; les annonces utilisent leurs replis quand cela est possible.
+- `/lancer` exige `Joindre des fichiers`, car la capture de la manche doit pouvoir être publiée.
+- Les permissions sont contrôlées au démarrage et lors des modifications du salon ou d'un rôle porté par le bot.
+- Un `Forbidden` Discord déclenche une nouvelle vérification au lieu de multiplier les tentatives d'envoi si `Envoyer des messages` a disparu.
+- Le propriétaire du serveur, le propriétaire du bot et les administrateurs disponibles dans le cache Discord reçoivent un DM d'alerte. Un même état de permissions n'est pas renotifié en boucle.
+- `/config statut` affiche l'état courant des permissions du salon.
+
 ## Autorisation des serveurs
 
 La v1 contrôle désormais les nouvelles installations avant toute configuration :

@@ -18,6 +18,14 @@ from database import Database
 
 BOT_VERSION = "1.0.2"
 ADMIN_ROLE_NAME = "Guess the Pix - admin"
+CRITICAL_GAME_CHANNEL_PERMISSIONS = ("view_channel", "send_messages")
+GAME_CHANNEL_PERMISSIONS = CRITICAL_GAME_CHANNEL_PERMISSIONS + ("attach_files", "embed_links")
+GAME_CHANNEL_PERMISSION_LABELS = {
+    "view_channel": "Voir le salon",
+    "send_messages": "Envoyer des messages",
+    "attach_files": "Joindre des fichiers",
+    "embed_links": "Intégrer des liens",
+}
 logger = logging.getLogger("scoreboard")
 
 config = load_config()
@@ -567,6 +575,27 @@ class StartRoundModal(discord.ui.Modal, title="Lancer la manche"):
             await interaction.response.send_message("Seul le meneur désigné peut lancer la manche.", ephemeral=True)
             return
 
+        channel = interaction.channel
+        if isinstance(channel, discord.abc.GuildChannel):
+            can_launch, missing_permissions = await self.bot.ensure_game_channel_permissions(
+                interaction.guild_id,
+                channel,
+                required_permissions=CRITICAL_GAME_CHANNEL_PERMISSIONS + ("attach_files",),
+                context="lancement d'une manche",
+            )
+            if not can_launch:
+                required_missing = [
+                    name for name in CRITICAL_GAME_CHANNEL_PERMISSIONS + ("attach_files",)
+                    if name in missing_permissions
+                ]
+                await interaction.response.send_message(
+                    "Impossible de lancer la manche : Guess the Pix n'a pas les permissions nécessaires dans ce salon.\n"
+                    f"Permissions manquantes : {self.bot.permission_labels(required_missing)}.\n"
+                    "Les administrateurs du serveur ont été avertis.",
+                    ephemeral=True,
+                )
+                return
+
         # La lecture d'une pièce jointe et surtout le téléchargement d'une URL
         # peuvent dépasser la fenêtre de réponse de Discord. Le modal est donc
         # acquitté avant toute opération réseau potentiellement lente.
@@ -670,6 +699,9 @@ class ScoreBot(commands.Bot):
         self.bot_owner_user_id: int | None = config.bot_owner_user_id
         self._guild_registry_reconciled = False
         self._hint_publish_lock = asyncio.Lock()
+        # Évite de répéter le même avertissement tant que l'état des permissions
+        # n'a pas changé. L'alerte est réarmée quand tout redevient normal.
+        self._channel_permission_alerts: dict[tuple[int, int], frozenset[str]] = {}
         self.round_images_dir = config.database_path.parent / "round_images"
         self.round_images_dir.mkdir(parents=True, exist_ok=True)
 
@@ -730,6 +762,160 @@ class ScoreBot(commands.Bot):
         except (discord.Forbidden, discord.HTTPException):
             return False
 
+    def game_channel_permission_issues(
+        self, guild: discord.Guild, channel: discord.abc.GuildChannel
+    ) -> tuple[list[str], list[str]]:
+        """Retourne les permissions critiques puis dégradées manquantes."""
+        bot_member = guild.me
+        if bot_member is None or not hasattr(channel, "permissions_for"):
+            return [], []
+        permissions = channel.permissions_for(bot_member)
+        critical = [
+            name for name in CRITICAL_GAME_CHANNEL_PERMISSIONS
+            if not bool(getattr(permissions, name, False))
+        ]
+        degraded = [
+            name for name in GAME_CHANNEL_PERMISSIONS
+            if name not in CRITICAL_GAME_CHANNEL_PERMISSIONS
+            and not bool(getattr(permissions, name, False))
+        ]
+        return critical, degraded
+
+    @staticmethod
+    def permission_labels(permission_names) -> str:
+        return ", ".join(
+            f"**{GAME_CHANNEL_PERMISSION_LABELS.get(name, name)}**"
+            for name in permission_names
+        )
+
+    def permission_alert_recipient_ids(self, guild: discord.Guild) -> set[int]:
+        """Propriétaire + admins Guess the Pix/Discord disponibles dans le cache."""
+        recipient_ids: set[int] = {int(guild.owner_id)}
+        guild_cfg = self.guild_configs.get(guild.id)
+        role_id = guild_cfg.get("admin_role_id") if guild_cfg else None
+        if role_id is not None:
+            role = guild.get_role(int(role_id))
+            if role is not None:
+                recipient_ids.update(int(member.id) for member in role.members if not member.bot)
+
+        # Le bot n'exige pas l'intent privilégié Members : on complète seulement
+        # avec les administrateurs Discord déjà présents dans le cache local.
+        for member in guild.members:
+            if member.bot:
+                continue
+            perms = member.guild_permissions
+            if perms.administrator or perms.manage_guild:
+                recipient_ids.add(int(member.id))
+        return recipient_ids
+
+    async def notify_game_channel_permission_issue(
+        self,
+        guild: discord.Guild,
+        channel_id: int,
+        missing_permissions,
+        *,
+        context: str | None = None,
+    ) -> None:
+        missing = frozenset(str(name) for name in missing_permissions)
+        if not missing:
+            return
+        key = (int(guild.id), int(channel_id))
+        if self._channel_permission_alerts.get(key) == missing:
+            return
+        self._channel_permission_alerts[key] = missing
+
+        ordered = [name for name in GAME_CHANNEL_PERMISSIONS if name in missing]
+        critical = any(name in missing for name in CRITICAL_GAME_CHANNEL_PERMISSIONS)
+        consequence = (
+            "Le bot ne peut plus publier les manches, accélérations, indices ou résultats dans ce salon."
+            if critical
+            else "Le bot peut encore publier, mais certaines annonces seront envoyées en mode dégradé."
+        )
+        context_line = f"\nContexte détecté : {context}." if context else ""
+        message = (
+            "⚠️ **Permissions insuffisantes pour Guess the Pix**\n"
+            f"Serveur : **{guild.name}**\n"
+            f"Salon configuré : <#{int(channel_id)}> (`{int(channel_id)}`)\n"
+            f"Permissions manquantes : {self.permission_labels(ordered)}\n\n"
+            f"{consequence}{context_line}\n\n"
+            "Vérifiez les permissions du salon pour le rôle du bot **Guess the Pix**."
+        )
+
+        recipient_ids = self.permission_alert_recipient_ids(guild)
+        bot_owner_id = await self.resolve_bot_owner_user_id()
+        if bot_owner_id is not None:
+            recipient_ids.add(int(bot_owner_id))
+
+        delivered = 0
+        for user_id in recipient_ids:
+            if await self.send_dm_to_user_id(user_id, message):
+                delivered += 1
+        logger.warning(
+            "Permissions insuffisantes sur le serveur %s, salon %s : %s (alerte DM livree a %s destinataire(s)).",
+            guild.id,
+            channel_id,
+            ", ".join(ordered),
+            delivered,
+        )
+
+    async def ensure_game_channel_permissions(
+        self,
+        guild_id: int,
+        channel: discord.abc.GuildChannel,
+        *,
+        required_permissions=CRITICAL_GAME_CHANNEL_PERMISSIONS,
+        context: str | None = None,
+        notify: bool = True,
+    ) -> tuple[bool, set[str]]:
+        guild = self.get_guild(int(guild_id))
+        if guild is None:
+            return True, set()
+        critical, degraded = self.game_channel_permission_issues(guild, channel)
+        missing = set(critical + degraded)
+        key = (int(guild.id), int(channel.id))
+        if missing:
+            if notify:
+                await self.notify_game_channel_permission_issue(
+                    guild, int(channel.id), missing, context=context
+                )
+        elif key in self._channel_permission_alerts:
+            self._channel_permission_alerts.pop(key, None)
+            logger.warning(
+                "Permissions du salon retablies sur le serveur %s, salon %s.",
+                guild.id,
+                channel.id,
+            )
+
+        required_missing = {name for name in required_permissions if name in missing}
+        return not required_missing, missing
+
+    async def check_configured_game_channel_permissions(self, guild: discord.Guild) -> None:
+        guild_cfg = self.guild_configs.get(guild.id)
+        if not guild_cfg or guild_cfg.get("game_channel_id") is None:
+            return
+        channel_id = int(guild_cfg["game_channel_id"])
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except discord.Forbidden:
+                await self.notify_game_channel_permission_issue(
+                    guild, channel_id, {"view_channel"}, context="vérification au démarrage"
+                )
+                return
+            except (discord.NotFound, discord.HTTPException) as exc:
+                logger.warning(
+                    "Salon configure %s inaccessible sur le serveur %s lors du controle des permissions : %s",
+                    channel_id,
+                    guild.id,
+                    exc,
+                )
+                return
+        if isinstance(channel, discord.abc.GuildChannel):
+            await self.ensure_game_channel_permissions(
+                guild.id, channel, context="vérification au démarrage"
+            )
+
     async def notify_access_request(self, guild: discord.Guild, *, previously_refused: bool = False) -> None:
         owner_id = await self.resolve_bot_owner_user_id()
         if owner_id is not None:
@@ -788,6 +974,7 @@ class ScoreBot(commands.Bot):
                     status = str(registration["status"]) if registration else "pending"
                     if status != "blocked":
                         await self.sync_commands_to_guild(guild.id)
+                await self.check_configured_game_channel_permissions(guild)
             except Exception:
                 logger.exception("Erreur de réconciliation du serveur %s", guild.id)
 
@@ -805,6 +992,24 @@ class ScoreBot(commands.Bot):
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         await db.mark_guild_inactive(guild.id)
         await self.reload_guild_configs()
+
+    async def on_guild_channel_update(
+        self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel
+    ) -> None:
+        guild_cfg = self.guild_configs.get(after.guild.id)
+        if not guild_cfg or guild_cfg.get("game_channel_id") is None:
+            return
+        if int(guild_cfg["game_channel_id"]) != int(after.id):
+            return
+        await self.ensure_game_channel_permissions(
+            after.guild.id, after, context="modification des permissions du salon"
+        )
+
+    async def on_guild_role_update(self, before: discord.Role, after: discord.Role) -> None:
+        bot_member = after.guild.me
+        if bot_member is None or all(int(role.id) != int(after.id) for role in bot_member.roles):
+            return
+        await self.check_configured_game_channel_permissions(after.guild)
 
     async def sync_commands_to_guild(self, guild_id: int) -> bool:
         guild = discord.Object(id=guild_id)
@@ -1193,6 +1398,15 @@ class ScoreBot(commands.Bot):
         if not isinstance(channel, discord.TextChannel):
             return None
 
+        can_render, _ = await self.ensure_game_channel_permissions(
+            guild_id,
+            channel,
+            required_permissions=CRITICAL_GAME_CHANNEL_PERMISSIONS + ("embed_links",),
+            context="mise à jour du scoreboard",
+        )
+        if not can_render:
+            return None
+
         embed = await self.build_scoreboard_embed(guild_id)
 
         if message_id:
@@ -1202,7 +1416,12 @@ class ScoreBot(commands.Bot):
                 return message
             except discord.NotFound:
                 await db.clear_scoreboard_message(guild_id)
-            except (discord.Forbidden, discord.HTTPException):
+            except discord.Forbidden:
+                await self.ensure_game_channel_permissions(
+                    guild_id, channel, context="mise à jour du scoreboard"
+                )
+                return None
+            except discord.HTTPException:
                 return None
 
         if not create_if_missing:
@@ -1210,7 +1429,12 @@ class ScoreBot(commands.Bot):
 
         try:
             message = await channel.send(embed=embed)
-        except (discord.Forbidden, discord.HTTPException):
+        except discord.Forbidden:
+            await self.ensure_game_channel_permissions(
+                guild_id, channel, context="création du scoreboard"
+            )
+            return None
+        except discord.HTTPException:
             return None
         await db.set_scoreboard_message(guild_id, channel.id, message.id)
         return message
@@ -1345,11 +1569,26 @@ class ScoreBot(commands.Bot):
         if not delivered:
             channel = self.get_channel(round_row["channel_id"])
             if isinstance(channel, discord.abc.Messageable):
+                if isinstance(channel, discord.abc.GuildChannel):
+                    can_send, _ = await self.ensure_game_channel_permissions(
+                        int(round_row["guild_id"]),
+                        channel,
+                        context="alerte publique de validation privée impossible",
+                    )
+                    if not can_send:
+                        return delivered
                 try:
                     await channel.send(
                         f"<@{round_row['master_id']}> je n’ai pas pu t’envoyer en privé une réponse à valider. "
                         "Vérifie que tes messages privés sont autorisés pour ce serveur."
                     )
+                except discord.Forbidden:
+                    if isinstance(channel, discord.abc.GuildChannel):
+                        await self.ensure_game_channel_permissions(
+                            int(round_row["guild_id"]),
+                            channel,
+                            context="alerte publique de validation privée impossible",
+                        )
                 except discord.HTTPException:
                     pass
 
@@ -1471,7 +1710,21 @@ class ScoreBot(commands.Bot):
         announcement_label: str,
     ) -> discord.Message | None:
         """Publie une annonce de manche avec replis capture -> sans capture -> texte seul."""
-        image_file = await self.prepare_round_repost_image(round_row)
+        can_send, missing_permissions = await self.ensure_game_channel_permissions(
+            int(round_row["guild_id"]), channel, context=announcement_label.lower()
+        )
+        if not can_send:
+            logger.warning(
+                "%s non tentee pour la manche %s du serveur %s : permission d'envoi absente.",
+                announcement_label,
+                round_row["round_number"],
+                round_row["guild_id"],
+            )
+            return None
+
+        image_file = None
+        if "attach_files" not in missing_permissions:
+            image_file = await self.prepare_round_repost_image(round_row)
 
         if image_file is not None:
             try:
@@ -1480,7 +1733,21 @@ class ScoreBot(commands.Bot):
                     view=RoundActionsView(self),
                     file=image_file,
                 )
-            except (discord.Forbidden, discord.HTTPException) as exc:
+            except discord.Forbidden as exc:
+                can_send, _ = await self.ensure_game_channel_permissions(
+                    int(round_row["guild_id"]), channel, context=announcement_label.lower()
+                )
+                if not can_send:
+                    return None
+                logger.warning(
+                    "%s avec capture impossible pour la manche %s du serveur %s : %s. "
+                    "Nouvelle tentative sans capture.",
+                    announcement_label,
+                    round_row["round_number"],
+                    round_row["guild_id"],
+                    exc,
+                )
+            except discord.HTTPException as exc:
                 logger.warning(
                     "%s avec capture impossible pour la manche %s du serveur %s : %s. "
                     "Nouvelle tentative sans capture.",
@@ -1492,7 +1759,21 @@ class ScoreBot(commands.Bot):
 
         try:
             return await channel.send(content=content, view=RoundActionsView(self))
-        except (discord.Forbidden, discord.HTTPException) as exc:
+        except discord.Forbidden as exc:
+            can_send, _ = await self.ensure_game_channel_permissions(
+                int(round_row["guild_id"]), channel, context=announcement_label.lower()
+            )
+            if not can_send:
+                return None
+            logger.warning(
+                "%s avec boutons impossible pour la manche %s du serveur %s : %s. "
+                "Nouvelle tentative en texte seul.",
+                announcement_label,
+                round_row["round_number"],
+                round_row["guild_id"],
+                exc,
+            )
+        except discord.HTTPException as exc:
             logger.warning(
                 "%s avec boutons impossible pour la manche %s du serveur %s : %s. "
                 "Nouvelle tentative en texte seul.",
@@ -1511,7 +1792,18 @@ class ScoreBot(commands.Bot):
                 round_row["guild_id"],
             )
             return message
-        except (discord.Forbidden, discord.HTTPException):
+        except discord.Forbidden:
+            await self.ensure_game_channel_permissions(
+                int(round_row["guild_id"]), channel, context=announcement_label.lower()
+            )
+            logger.exception(
+                "Echec definitif de %s pour la manche %s du serveur %s.",
+                announcement_label.lower(),
+                round_row["round_number"],
+                round_row["guild_id"],
+            )
+            return None
+        except discord.HTTPException:
             logger.exception(
                 "Echec definitif de %s pour la manche %s du serveur %s.",
                 announcement_label.lower(),
@@ -1539,14 +1831,35 @@ class ScoreBot(commands.Bot):
         result_details: str,
     ) -> None:
         """Publie les deux parties de fin de manche sans qu'un echec bloque la finalisation."""
-        image_file = await self.prepare_round_repost_image(round_row)
+        can_send, missing_permissions = await self.ensure_game_channel_permissions(
+            int(round_row["guild_id"]), channel, context="annonce de fin de manche"
+        )
+        if not can_send:
+            return
+
+        image_file = None
+        if "attach_files" not in missing_permissions:
+            image_file = await self.prepare_round_repost_image(round_row)
         header_sent = False
 
         if image_file is not None:
             try:
                 await channel.send(content=result_content, file=image_file)
                 header_sent = True
-            except (discord.Forbidden, discord.HTTPException) as exc:
+            except discord.Forbidden as exc:
+                can_send, _ = await self.ensure_game_channel_permissions(
+                    int(round_row["guild_id"]), channel, context="annonce de fin de manche"
+                )
+                if not can_send:
+                    return
+                logger.warning(
+                    "Annonce de fin avec capture impossible pour la manche %s du serveur %s : %s. "
+                    "Nouvelle tentative sans capture.",
+                    round_row["round_number"],
+                    round_row["guild_id"],
+                    exc,
+                )
+            except discord.HTTPException as exc:
                 logger.warning(
                     "Annonce de fin avec capture impossible pour la manche %s du serveur %s : %s. "
                     "Nouvelle tentative sans capture.",
@@ -1559,7 +1872,18 @@ class ScoreBot(commands.Bot):
             try:
                 await channel.send(content=result_content)
                 header_sent = True
-            except (discord.Forbidden, discord.HTTPException):
+            except discord.Forbidden:
+                can_send, _ = await self.ensure_game_channel_permissions(
+                    int(round_row["guild_id"]), channel, context="annonce de fin de manche"
+                )
+                logger.exception(
+                    "Echec de l'annonce principale de fin pour la manche %s du serveur %s.",
+                    round_row["round_number"],
+                    round_row["guild_id"],
+                )
+                if not can_send:
+                    return
+            except discord.HTTPException:
                 logger.exception(
                     "Echec de l'annonce principale de fin pour la manche %s du serveur %s.",
                     round_row["round_number"],
@@ -1568,7 +1892,17 @@ class ScoreBot(commands.Bot):
 
         try:
             await channel.send(content=result_details)
-        except (discord.Forbidden, discord.HTTPException):
+        except discord.Forbidden:
+            await self.ensure_game_channel_permissions(
+                int(round_row["guild_id"]), channel, context="détail de fin de manche"
+            )
+            logger.exception(
+                "Echec du detail de fin pour la manche %s du serveur %s. "
+                "La finalisation et la mise a jour des scores continuent.",
+                round_row["round_number"],
+                round_row["guild_id"],
+            )
+        except discord.HTTPException:
             logger.exception(
                 "Echec du detail de fin pour la manche %s du serveur %s. "
                 "La finalisation et la mise a jour des scores continuent.",
@@ -1584,22 +1918,52 @@ class ScoreBot(commands.Bot):
         fallback_content: str,
     ) -> bool:
         """Publie la fin de periode en embed, puis en texte si les embeds sont refuses."""
-        try:
-            await channel.send(embed=period_embed)
-            return True
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            logger.warning(
-                "Annonce embed de fin de periode %s impossible pour le serveur %s : %s. "
-                "Nouvelle tentative en texte seul.",
-                period["number"],
-                period["guild_id"],
-                exc,
-            )
+        can_send, missing_permissions = await self.ensure_game_channel_permissions(
+            int(period["guild_id"]), channel, context="annonce de fin de période"
+        )
+        if not can_send:
+            return False
+
+        if "embed_links" not in missing_permissions:
+            try:
+                await channel.send(embed=period_embed)
+                return True
+            except discord.Forbidden as exc:
+                can_send, _ = await self.ensure_game_channel_permissions(
+                    int(period["guild_id"]), channel, context="annonce de fin de période"
+                )
+                if not can_send:
+                    return False
+                logger.warning(
+                    "Annonce embed de fin de periode %s impossible pour le serveur %s : %s. "
+                    "Nouvelle tentative en texte seul.",
+                    period["number"],
+                    period["guild_id"],
+                    exc,
+                )
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "Annonce embed de fin de periode %s impossible pour le serveur %s : %s. "
+                    "Nouvelle tentative en texte seul.",
+                    period["number"],
+                    period["guild_id"],
+                    exc,
+                )
 
         try:
             await channel.send(content=fallback_content)
             return True
-        except (discord.Forbidden, discord.HTTPException):
+        except discord.Forbidden:
+            await self.ensure_game_channel_permissions(
+                int(period["guild_id"]), channel, context="annonce de fin de période"
+            )
+            logger.exception(
+                "Echec definitif de l'annonce de fin de periode %s pour le serveur %s.",
+                period["number"],
+                period["guild_id"],
+            )
+            return False
+        except discord.HTTPException:
             logger.exception(
                 "Echec definitif de l'annonce de fin de periode %s pour le serveur %s.",
                 period["number"],
@@ -1776,10 +2140,32 @@ class ScoreBot(commands.Bot):
             if not delivered:
                 channel = self.get_channel(round_row["channel_id"])
                 if isinstance(channel, discord.abc.Messageable):
-                    await channel.send(
-                        f"<@{round_row['master_id']}> les réponses de la manche #{round_row['round_number']} sont closes ; "
-                        f"{len(pending)} validation(s) restent en attente."
-                    )
+                    can_send = True
+                    if isinstance(channel, discord.abc.GuildChannel):
+                        can_send, _ = await self.ensure_game_channel_permissions(
+                            int(round_row["guild_id"]),
+                            channel,
+                            context="rappel public des validations en attente",
+                        )
+                    if can_send:
+                        try:
+                            await channel.send(
+                                f"<@{round_row['master_id']}> les réponses de la manche #{round_row['round_number']} sont closes ; "
+                                f"{len(pending)} validation(s) restent en attente."
+                            )
+                        except discord.Forbidden:
+                            if isinstance(channel, discord.abc.GuildChannel):
+                                await self.ensure_game_channel_permissions(
+                                    int(round_row["guild_id"]),
+                                    channel,
+                                    context="rappel public des validations en attente",
+                                )
+                        except discord.HTTPException:
+                            logger.exception(
+                                "Impossible de publier le rappel de validations de la manche %s du serveur %s.",
+                                round_row["round_number"],
+                                round_row["guild_id"],
+                            )
             return False
 
         await self.finish_round(round_id)
@@ -2121,6 +2507,18 @@ async def configure_server(
         )
         return
 
+    critical_permissions, degraded_permissions = bot.game_channel_permission_issues(
+        interaction.guild, salon
+    )
+    if critical_permissions:
+        await interaction.response.send_message(
+            "❌ **Impossible de configurer ce salon.**\n"
+            "Guess the Pix doit au minimum pouvoir voir le salon et y envoyer des messages.\n"
+            f"Permissions manquantes : {bot.permission_labels(critical_permissions)}.",
+            ephemeral=True,
+        )
+        return
+
     effective_role = role_admin
     role_created = False
     if creer_role_admin:
@@ -2164,12 +2562,20 @@ async def configure_server(
     role_display = effective_role.mention if effective_role else "**aucun rôle dédié**"
     if role_created:
         role_display += f" (créé sous le nom **{ADMIN_ROLE_NAME}**)"
+    degraded_warning = ""
+    if degraded_permissions:
+        degraded_warning = (
+            "\n⚠️ Permissions recommandées manquantes : "
+            + bot.permission_labels(degraded_permissions)
+            + ". Certaines annonces pourront être envoyées en mode dégradé."
+        )
     await interaction.response.send_message(
         "✅ **Guess the Pix est configuré.**\n"
         f"Salon du jeu : {salon.mention}\n"
         f"Rôle admin : {role_display}\n"
         "Essais : **illimités** par défaut\n"
-        "Périodes : **sans limite** par défaut",
+        "Périodes : **sans limite** par défaut"
+        + degraded_warning,
         ephemeral=True,
     )
 
@@ -2206,10 +2612,23 @@ async def config_status(interaction: discord.Interaction):
     progress, limit = await db.period_progress(period["id"])
     role_id = guild_cfg.get("admin_role_id")
     attempt_limit = state["default_attempt_limit"]
+    permission_status = "⚠️ salon inaccessible"
+    configured_channel = interaction.guild.get_channel(int(guild_cfg["game_channel_id"])) if interaction.guild else None
+    if isinstance(configured_channel, discord.abc.GuildChannel):
+        critical_permissions, degraded_permissions = bot.game_channel_permission_issues(
+            interaction.guild, configured_channel
+        )
+        if critical_permissions:
+            permission_status = "❌ " + bot.permission_labels(critical_permissions)
+        elif degraded_permissions:
+            permission_status = "⚠️ " + bot.permission_labels(degraded_permissions)
+        else:
+            permission_status = "✅ complètes"
     await interaction.response.send_message(
         "⚙️ **Configuration Guess the Pix**\n"
         f"Salon : <#{int(guild_cfg['game_channel_id'])}>\n"
         f"Rôle admin : {f'<@&{int(role_id)}>' if role_id else '**aucun rôle dédié**'}\n"
+        f"Permissions du salon : {permission_status}\n"
         f"Essais : **{'illimités' if attempt_limit is None else str(attempt_limit)}**\n"
         f"Période : **{period['number']}** — "
         f"{'sans limite' if limit is None else f'{progress}/{limit} manches'}\n"
@@ -2227,9 +2646,32 @@ async def config_channel(interaction: discord.Interaction, salon: discord.TextCh
     if bot.guild_configs.get(interaction.guild_id) is None:
         await interaction.response.send_message("Utilise d’abord `/configurer`.", ephemeral=True)
         return
+    if interaction.guild is None or salon.guild.id != interaction.guild_id:
+        await interaction.response.send_message("Le salon doit appartenir à ce serveur.", ephemeral=True)
+        return
+    critical_permissions, degraded_permissions = bot.game_channel_permission_issues(
+        interaction.guild, salon
+    )
+    if critical_permissions:
+        await interaction.response.send_message(
+            "❌ Impossible d'utiliser ce salon : permissions manquantes pour Guess the Pix : "
+            + bot.permission_labels(critical_permissions)
+            + ".",
+            ephemeral=True,
+        )
+        return
     await db.set_guild_channel(interaction.guild_id, salon.id)
     await bot.reload_guild_configs()
-    await interaction.response.send_message(f"Salon du jeu défini sur {salon.mention}.", ephemeral=True)
+    warning = ""
+    if degraded_permissions:
+        warning = (
+            "\n⚠️ Permissions recommandées manquantes : "
+            + bot.permission_labels(degraded_permissions)
+            + "."
+        )
+    await interaction.response.send_message(
+        f"Salon du jeu défini sur {salon.mention}." + warning, ephemeral=True
+    )
 
 
 @config_group.command(name="role-admin", description="Changer le rôle administrateur du jeu")

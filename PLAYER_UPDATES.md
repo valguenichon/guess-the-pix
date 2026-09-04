@@ -4,6 +4,7 @@
 - L'annonce publique du mode accéléré est rendue plus robuste : si l'envoi avec la capture échoue, le bot retente sans image puis, si nécessaire, en texte seul.
 - Les annonces d'indices utilisent désormais le même mécanisme de repli et ne sont marquées comme publiées qu'après un envoi réussi.
 - Les annonces de fin de manche et de fin de période ne peuvent plus interrompre la finalisation si Discord refuse une image ou un embed.
+- Le bot vérifie maintenant les permissions de son salon de jeu et avertit les responsables du serveur si une permission empêche ou dégrade les annonces.
 
 ---
 
