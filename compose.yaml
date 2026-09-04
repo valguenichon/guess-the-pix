@@ -3,7 +3,7 @@ name: ${COMPOSE_PROJECT_NAME:-guess-the-pix}
 services:
   guess-the-pix:
     build: .
-    image: guess-the-pix:1.0.1
+    image: guess-the-pix:1.0.2
     container_name: ${CONTAINER_NAME:-guess-the-pix}
     restart: unless-stopped
     env_file:

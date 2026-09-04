@@ -16,7 +16,7 @@ from discord.ext import commands, tasks
 from config import load_config
 from database import Database
 
-BOT_VERSION = "1.0.1"
+BOT_VERSION = "1.0.2"
 ADMIN_ROLE_NAME = "Guess the Pix - admin"
 logger = logging.getLogger("scoreboard")
 
@@ -669,6 +669,7 @@ class ScoreBot(commands.Bot):
         self.guild_configs: dict[int, dict[str, int | None]] = {}
         self.bot_owner_user_id: int | None = config.bot_owner_user_id
         self._guild_registry_reconciled = False
+        self._hint_publish_lock = asyncio.Lock()
         self.round_images_dir = config.database_path.parent / "round_images"
         self.round_images_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1462,6 +1463,150 @@ class ScoreBot(commands.Bot):
             if not remaining:
                 await self.finish_round(refreshed["round_id"])
 
+    async def send_round_action_announcement(
+        self,
+        channel: discord.abc.Messageable,
+        round_row,
+        content: str,
+        announcement_label: str,
+    ) -> discord.Message | None:
+        """Publie une annonce de manche avec replis capture -> sans capture -> texte seul."""
+        image_file = await self.prepare_round_repost_image(round_row)
+
+        if image_file is not None:
+            try:
+                return await channel.send(
+                    content=content,
+                    view=RoundActionsView(self),
+                    file=image_file,
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "%s avec capture impossible pour la manche %s du serveur %s : %s. "
+                    "Nouvelle tentative sans capture.",
+                    announcement_label,
+                    round_row["round_number"],
+                    round_row["guild_id"],
+                    exc,
+                )
+
+        try:
+            return await channel.send(content=content, view=RoundActionsView(self))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                "%s avec boutons impossible pour la manche %s du serveur %s : %s. "
+                "Nouvelle tentative en texte seul.",
+                announcement_label,
+                round_row["round_number"],
+                round_row["guild_id"],
+                exc,
+            )
+
+        try:
+            message = await channel.send(content=content)
+            logger.warning(
+                "%s envoyee en texte seul pour la manche %s du serveur %s.",
+                announcement_label,
+                round_row["round_number"],
+                round_row["guild_id"],
+            )
+            return message
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Echec definitif de %s pour la manche %s du serveur %s.",
+                announcement_label.lower(),
+                round_row["round_number"],
+                round_row["guild_id"],
+            )
+            return None
+
+    async def send_acceleration_announcement(
+        self,
+        channel: discord.abc.Messageable,
+        round_row,
+        content: str,
+    ) -> bool:
+        message = await self.send_round_action_announcement(
+            channel, round_row, content, "Annonce d'acceleration"
+        )
+        return message is not None
+
+    async def send_round_end_announcements(
+        self,
+        channel: discord.abc.Messageable,
+        round_row,
+        result_content: str,
+        result_details: str,
+    ) -> None:
+        """Publie les deux parties de fin de manche sans qu'un echec bloque la finalisation."""
+        image_file = await self.prepare_round_repost_image(round_row)
+        header_sent = False
+
+        if image_file is not None:
+            try:
+                await channel.send(content=result_content, file=image_file)
+                header_sent = True
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "Annonce de fin avec capture impossible pour la manche %s du serveur %s : %s. "
+                    "Nouvelle tentative sans capture.",
+                    round_row["round_number"],
+                    round_row["guild_id"],
+                    exc,
+                )
+
+        if not header_sent:
+            try:
+                await channel.send(content=result_content)
+                header_sent = True
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "Echec de l'annonce principale de fin pour la manche %s du serveur %s.",
+                    round_row["round_number"],
+                    round_row["guild_id"],
+                )
+
+        try:
+            await channel.send(content=result_details)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Echec du detail de fin pour la manche %s du serveur %s. "
+                "La finalisation et la mise a jour des scores continuent.",
+                round_row["round_number"],
+                round_row["guild_id"],
+            )
+
+    async def send_period_end_announcement(
+        self,
+        channel: discord.abc.Messageable,
+        period,
+        period_embed: discord.Embed,
+        fallback_content: str,
+    ) -> bool:
+        """Publie la fin de periode en embed, puis en texte si les embeds sont refuses."""
+        try:
+            await channel.send(embed=period_embed)
+            return True
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                "Annonce embed de fin de periode %s impossible pour le serveur %s : %s. "
+                "Nouvelle tentative en texte seul.",
+                period["number"],
+                period["guild_id"],
+                exc,
+            )
+
+        try:
+            await channel.send(content=fallback_content)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Echec definitif de l'annonce de fin de periode %s pour le serveur %s.",
+                period["number"],
+                period["guild_id"],
+            )
+            return False
+
     async def trigger_acceleration(self, round_id: int, accelerated_at: datetime) -> bool:
         round_row = await db.get_round(round_id)
         if not round_row or round_row["status"] != "open" or round_row["accelerated_at"]:
@@ -1498,14 +1643,17 @@ class ScoreBot(commands.Bot):
                 f"(<t:{int(effective_end.timestamp())}:R>) pour répondre.\n"
                 "Les indices encore cachés sont rapprochés en conséquence."
             )
-            image_file = await self.prepare_round_repost_image(refreshed)
-            send_kwargs = {"content": acceleration_content, "view": RoundActionsView(self)}
-            if image_file is not None:
-                send_kwargs["file"] = image_file
-            try:
-                await channel.send(**send_kwargs)
-            except discord.HTTPException:
-                pass
+            await self.send_acceleration_announcement(
+                channel, refreshed, acceleration_content
+            )
+        else:
+            logger.warning(
+                "Annonce d'acceleration impossible pour la manche %s du serveur %s : "
+                "canal %s introuvable ou non messageable",
+                refreshed["round_number"],
+                refreshed["guild_id"],
+                refreshed["channel_id"],
+            )
 
         await self.update_scoreboard(refreshed["guild_id"])
         # Publie immédiatement un indice dont l’horaire normal était déjà dépassé.
@@ -1513,50 +1661,67 @@ class ScoreBot(commands.Bot):
         return True
 
     async def publish_due_hints(self) -> None:
-        now = datetime.now(timezone.utc)
-        for round_row in await db.open_rounds():
-            if not round_has_hints(round_row):
-                continue
-            for hint_number in (1, 2, 3):
-                if round_row[f"hint_{hint_number}_revealed_at"]:
+        # Le scheduler et une acceleration peuvent appeler cette methode en meme temps.
+        # Le verrou empeche deux publications concurrentes du meme indice.
+        async with self._hint_publish_lock:
+            now = datetime.now(timezone.utc)
+            for initial_round in await db.open_rounds():
+                round_row = initial_round
+                if not round_has_hints(round_row):
                     continue
-                raw_due_at = round_row[f"hint_{hint_number}_scheduled_at"]
-                if not raw_due_at:
-                    started = datetime.fromisoformat(round_row["started_at"])
-                    due_at = started + timedelta(days=hint_number * 2)
-                else:
-                    due_at = datetime.fromisoformat(raw_due_at)
-                if now < due_at:
-                    continue
-
-                channel = self.get_channel(round_row["channel_id"])
-                if channel is None:
-                    try:
-                        channel = await self.fetch_channel(round_row["channel_id"])
-                    except discord.HTTPException:
-                        channel = None
-                if not isinstance(channel, discord.abc.Messageable):
-                    continue
-
-                remaining_points = {1: "5 / 4 / 3", 2: "4 / 3 / 2", 3: "3 / 2 / 1"}[hint_number]
-                hint_content = (
-                    f"💡 Manche #{round_row['round_number']} - Indice {hint_number}/3\n\n"
-                    f"**{round_row[f'hint_{hint_number}']}**\n\n"
-                    f"*Barème du podium à partir de maintenant : {remaining_points} points • 1 pt à partir de la 4e place*"
-                )
-                image_file = await self.prepare_round_repost_image(round_row)
-                send_kwargs = {"content": hint_content, "view": RoundActionsView(self)}
-                if image_file is not None:
-                    send_kwargs["file"] = image_file
-                try:
-                    hint_message = await channel.send(**send_kwargs)
-                except discord.HTTPException:
-                    continue
-
-                revealed_at = hint_message.created_at.isoformat()
-                if await db.mark_hint_revealed(round_row["id"], hint_number, revealed_at):
+                for hint_number in (1, 2, 3):
+                    # Recharge avant chaque indice : une autre operation peut avoir modifie
+                    # la manche avant notre prise du verrou ou entre deux publications.
                     round_row = await db.get_round(round_row["id"])
-                    await self.update_scoreboard(round_row["guild_id"])
+                    if not round_row or round_row["status"] != "open":
+                        break
+                    if round_row[f"hint_{hint_number}_revealed_at"]:
+                        continue
+                    raw_due_at = round_row[f"hint_{hint_number}_scheduled_at"]
+                    if not raw_due_at:
+                        started = datetime.fromisoformat(round_row["started_at"])
+                        due_at = started + timedelta(days=hint_number * 2)
+                    else:
+                        due_at = datetime.fromisoformat(raw_due_at)
+                    if now < due_at:
+                        continue
+
+                    channel = self.get_channel(round_row["channel_id"])
+                    if channel is None:
+                        try:
+                            channel = await self.fetch_channel(round_row["channel_id"])
+                        except discord.HTTPException:
+                            channel = None
+                    if not isinstance(channel, discord.abc.Messageable):
+                        logger.warning(
+                            "Indice %s impossible pour la manche %s du serveur %s : canal %s introuvable.",
+                            hint_number,
+                            round_row["round_number"],
+                            round_row["guild_id"],
+                            round_row["channel_id"],
+                        )
+                        continue
+
+                    remaining_points = {1: "5 / 4 / 3", 2: "4 / 3 / 2", 3: "3 / 2 / 1"}[hint_number]
+                    hint_content = (
+                        f"💡 Manche #{round_row['round_number']} - Indice {hint_number}/3\n\n"
+                        f"**{round_row[f'hint_{hint_number}']}**\n\n"
+                        f"*Barème du podium à partir de maintenant : {remaining_points} points • 1 pt à partir de la 4e place*"
+                    )
+                    hint_message = await self.send_round_action_announcement(
+                        channel,
+                        round_row,
+                        hint_content,
+                        f"Annonce de l'indice {hint_number}",
+                    )
+                    if hint_message is None:
+                        # Ne pas marquer l'indice : le prochain passage du scheduler retentera.
+                        continue
+
+                    revealed_at = hint_message.created_at.isoformat()
+                    if await db.mark_hint_revealed(round_row["id"], hint_number, revealed_at):
+                        round_row = await db.get_round(round_row["id"])
+                        await self.update_scoreboard(round_row["guild_id"])
 
     @tasks.loop(seconds=60)
     async def close_due_rounds(self) -> None:
@@ -1780,8 +1945,6 @@ class ScoreBot(commands.Bot):
             "*Le podium dépend du rang et des indices révélés ; à partir de la 4e place, toute bonne réponse rapporte 1 point.*"
         )
 
-        image_file = await self.prepare_round_repost_image(round_row)
-
         channel = self.get_channel(round_row["channel_id"])
         if channel is None:
             try:
@@ -1793,11 +1956,20 @@ class ScoreBot(commands.Bot):
                 f"# 🎮 {round_row['solution']}\n"
                 f"## Manche #{round_row['round_number']} terminée !"
             )
-            if image_file is not None:
-                await channel.send(content=result_content, file=image_file)
-            else:
-                await channel.send(content=result_content)
-            await channel.send(content="\n\n".join(result_lines))
+            await self.send_round_end_announcements(
+                channel,
+                round_row,
+                result_content,
+                "\n\n".join(result_lines),
+            )
+        else:
+            logger.warning(
+                "Annonces de fin impossibles pour la manche %s du serveur %s : "
+                "canal %s introuvable ou non messageable. La finalisation continue.",
+                round_row["round_number"],
+                round_row["guild_id"],
+                round_row["channel_id"],
+            )
 
         # Une période limitée se clôture une fois son nombre de manches atteint.
         period = await db.get_current_period(round_row["guild_id"])
@@ -1821,10 +1993,26 @@ class ScoreBot(commands.Bot):
                 next_period = await db.close_period_and_create_next(
                     round_row["guild_id"], period["id"]
                 )
+                period_footer = ""
                 if next_period:
-                    period_embed.set_footer(text=f"La Période {next_period['number']} commence maintenant.")
+                    period_footer = f"La Période {next_period['number']} commence maintenant."
+                    period_embed.set_footer(text=period_footer)
+                period_fallback = (
+                    f"# 🏆 Fin de la Période {period['number']}\n\n"
+                    + ("\n".join(final_lines) if final_lines else "Aucun point marqué pendant cette période.")
+                    + (f"\n\n{period_footer}" if period_footer else "")
+                )
                 if isinstance(channel, discord.abc.Messageable):
-                    await channel.send(embed=period_embed)
+                    await self.send_period_end_announcement(
+                        channel, period, period_embed, period_fallback
+                    )
+                else:
+                    logger.warning(
+                        "Annonce de fin de periode %s impossible pour le serveur %s : "
+                        "canal de manche introuvable. La nouvelle periode a bien ete creee.",
+                        period["number"],
+                        round_row["guild_id"],
+                    )
 
         await self.update_scoreboard(round_row["guild_id"])
 
@@ -2538,6 +2726,12 @@ async def answer(interaction: discord.Interaction, reponse: str):
     if await db.user_has_correct_attempt(round_row["id"], interaction.user.id):
         await interaction.response.send_message("Tu as déjà trouvé le jeu pour cette manche.", ephemeral=True)
         return
+    if await db.user_pending_attempt_count(round_row["id"], interaction.user.id):
+        await interaction.response.send_message(
+            "Tu as déjà une réponse en attente de validation par le meneur.",
+            ephemeral=True,
+        )
+        return
     attempt_limit = round_row["attempt_limit"]
     if attempt_limit is not None:
         used_attempts = await db.user_attempt_count(round_row["id"], interaction.user.id)
@@ -2563,6 +2757,14 @@ async def answer(interaction: discord.Interaction, reponse: str):
     attempt_id = await db.create_attempt(
         interaction.guild_id, round_row["id"], interaction.user.id, answer_text
     )
+    # Protection transactionnelle contre deux /reponse reçus quasiment en même temps.
+    if attempt_id is None:
+        await interaction.followup.send(
+            "Tu as déjà une réponse en attente de validation par le meneur.",
+            ephemeral=True,
+        )
+        return
+
     delivered = await bot.notify_leader(round_row, attempt_id, interaction.user, answer_text)
     if not delivered:
         await db.delete_pending_attempt(attempt_id)

@@ -1,4 +1,4 @@
-# Staging setup — v1.0.1
+# Staging setup — v1.0.2
 
 1. Create a separate Discord application/bot for staging and add it only to the test server(s).
 2. Create `/volume1/docker/guess-the-pix-staging/` on the Synology NAS.
@@ -17,7 +17,7 @@ BOT_OWNER_USER_ID=<your Discord user ID>
 ROUND_DURATION_DAYS=7
 ```
 
-5. Start the staging Compose project. Its project/container names will be `guess-the-pix-staging`; the image remains explicitly named `guess-the-pix:1.0.1` by `compose.yaml`.
+5. Start the staging Compose project. Its project/container names will be `guess-the-pix-staging`; the image remains explicitly named `guess-the-pix:1.0.2` by `compose.yaml`.
 6. Existing configured staging servers are preserved automatically. For a brand-new test server, verify the authorization workflow first:
 
 ```text
@@ -40,7 +40,7 @@ The admin role is optional. An existing role can be selected, or the bot can cre
 /aide
 ```
 
-`/aide` should show `Guess the Pix • v1.0.1 • STAGING`.
+`/aide` should show `Guess the Pix • v1.0.2 • STAGING`.
 
 ## Recommended staging checks
 

@@ -1,6 +1,10 @@
-# Guess the Pix v1.0.1
+# Guess the Pix v1.0.2
 
 Première version stable multi-serveurs de Guess the Pix.
+
+## Fiabilité des annonces en v1.0.2
+
+Les annonces d'accélération et d'indices utilisent un repli automatique si Discord refuse la capture : nouvel essai sans image, puis texte seul si nécessaire. Les annonces de fin de manche et de fin de période disposent également d'un mode de repli et leurs erreurs n'interrompent plus la finalisation, les scores ni le passage à la période suivante. La publication des indices est sérialisée pour éviter un doublon si le scheduler et une accélération se déclenchent simultanément.
 
 ## Autorisation des serveurs
 
@@ -130,7 +134,7 @@ Le nom du jeu et les trois indices sont ensuite demandés dans le formulaire.
 
 ## Docker / Synology
 
-Le `compose.yaml` fourni utilise `guess-the-pix` comme nom par défaut pour le projet Compose, le service et le conteneur. L’image Docker est explicitement fixée dans le Compose à `guess-the-pix:1.0.1` afin que son nom ne dépende pas du nom du projet Compose.
+Le `compose.yaml` fourni utilise `guess-the-pix` comme nom par défaut pour le projet Compose, le service et le conteneur. L’image Docker est explicitement fixée dans le Compose à `guess-the-pix:1.0.2` afin que son nom ne dépende pas du nom du projet Compose.
 
 Les valeurs par défaut sont :
 
@@ -138,7 +142,7 @@ Les valeurs par défaut sont :
 Projet Compose : guess-the-pix
 Service         : guess-the-pix
 Conteneur       : guess-the-pix
-Image           : guess-the-pix:1.0.1
+Image           : guess-the-pix:1.0.2
 ```
 
 Le `compose.yaml` utilise également des chemins relatifs afin que le même paquet puisse être placé dans deux répertoires indépendants. Si production et staging tournent simultanément sur le même hôte Docker, le staging doit surcharger le nom du projet et du conteneur dans son `.env` :
@@ -148,7 +152,7 @@ COMPOSE_PROJECT_NAME=guess-the-pix-staging
 CONTAINER_NAME=guess-the-pix-staging
 ```
 
-L’image reste `guess-the-pix:1.0.1` car son nom est volontairement fixé dans `compose.yaml`.
+L’image reste `guess-the-pix:1.0.2` car son nom est volontairement fixé dans `compose.yaml`.
 
 Pour une nouvelle instance staging, un build initial est nécessaire. Ensuite, comme `bot.py`, `config.py` et `database.py` sont montés directement, les mises à jour de ces fichiers ne nécessitent normalement qu'un redémarrage du conteneur tant que les dépendances ne changent pas.
 

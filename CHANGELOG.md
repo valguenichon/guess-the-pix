@@ -1,3 +1,32 @@
+# Changelog — v1.0.2
+
+## Pending answer guard
+
+- A player can now have only one answer awaiting leader validation for a given round.
+- A second `/reponse` is refused while the previous answer is still `pending`; no extra attempt is consumed and no duplicate validation DM is sent.
+- The database insertion is transaction-protected so near-simultaneous submissions cannot create two pending attempts.
+
+## Acceleration announcement delivery
+
+- Acceleration remains scoped to the round and server that received the validated correct answer.
+- If Discord rejects the acceleration announcement with the round screenshot, the bot retries without the image.
+- If the enriched message still fails, the bot makes a final text-only attempt so the acceleration is visible whenever the channel remains writable.
+- Discord delivery failures are now logged instead of being silently ignored.
+
+## Hint and round-end announcement resilience
+
+- Hint announcements now use the same fallback chain: screenshot + buttons, then buttons without screenshot, then text only.
+- A failed hint delivery is not marked as revealed, allowing the scheduler to retry later.
+- Hint publication is serialized so the scheduler and an acceleration cannot publish the same due hint concurrently.
+- End-of-round announcements retry the result header without the screenshot if the media upload fails.
+- The detailed round result is sent independently so a failed header cannot interrupt score/period finalization.
+- End-of-period embeds retry as plain text if Discord rejects the embed.
+- Announcement failures are logged and no longer abort the remaining round-finalization workflow.
+
+- Updated the pinned Docker image tag to `guess-the-pix:1.0.2`.
+
+---
+
 # Changelog — v1.0.1
 
 ## Command cleanup after v0.x migration

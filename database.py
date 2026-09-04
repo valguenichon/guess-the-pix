@@ -1033,8 +1033,26 @@ class Database:
             await db.commit()
             return True
 
-    async def create_attempt(self, guild_id: int, round_id: int, user_id: int, answer: str) -> int:
+    async def create_attempt(self, guild_id: int, round_id: int, user_id: int, answer: str) -> int | None:
+        """Crée une tentative seulement si le joueur n'en a aucune en attente.
+
+        BEGIN IMMEDIATE rend le contrôle et l'insertion atomiques, afin que deux
+        commandes /reponse quasi simultanées ne puissent pas créer deux pending.
+        """
         async with self.connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            pending = await (await db.execute(
+                """
+                SELECT 1 FROM attempts
+                WHERE round_id = ? AND user_id = ? AND status = 'pending'
+                LIMIT 1
+                """,
+                (round_id, user_id),
+            )).fetchone()
+            if pending is not None:
+                await db.rollback()
+                return None
+
             cursor = await db.execute(
                 """
                 INSERT INTO attempts(guild_id, round_id, user_id, answer, submitted_at)
